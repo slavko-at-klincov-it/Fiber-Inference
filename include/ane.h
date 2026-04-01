@@ -1,0 +1,1 @@
+/Users/slavkoklincov/Documents/ClaudeCodeFolder/ANE-Training/libane/ane.h

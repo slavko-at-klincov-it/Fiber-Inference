@@ -1,0 +1,11 @@
+models/*.gguf
+models/*.bin
+models/.cache/
+*.o
+*.dylib
+!lib/libane.dylib
+fiber-inference
+.DS_Store
+debug/*.bin
+debug/**/*.bin
+debug/*.txt

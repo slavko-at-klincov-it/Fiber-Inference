@@ -8,10 +8,11 @@ um groessere Modelle und laengere Kontexte zu ermoeglichen als jedes existierend
 
 ## Status
 
-Phase 1 fertig: GPU-only Inference mit TinyLlama-1.1B Q4_K_M.
-- **40 tok/s** Decode, **61 MB RSS** [MEASURED]
-- Zero-copy mmap Weights, Single Command Buffer, FP16 Buffers, SIMD Reductions
-- Q4_K + Q6_K + Q5_K Dequant-MatVec Fused Kernels
+Phase 2 fertig: ANE Attention + GPU FFN (Fiber-Loading).
+- **182 tok/s Prefill**, **36 tok/s Decode** auf TinyLlama-1.1B [MEASURED]
+- 4.5x Prefill-Speedup gegenueber GPU-only Baseline (40 tok/s)
+- Fused MIL SDPA mit GQA + RoPE auf ANE, MPS MatrixMultiplication fuer FFN
+- Details: `docs/phase2-findings.md`
 
 ## Hardware — Die 5 Compute Units
 

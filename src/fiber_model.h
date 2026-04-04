@@ -18,6 +18,11 @@ typedef struct {
     _Float16 *w2[FIBER_LAYERS];        // [dim, ffn_dim]
     _Float16 *attn_norm[FIBER_LAYERS];  // [dim]
     _Float16 *ffn_norm[FIBER_LAYERS];   // [dim]
+    // Pre-converted FP32 FFN weights for AMX (cblas_sgemm)
+    float *w1_f32[FIBER_LAYERS];        // [ffn_dim, dim]
+    float *w3_f32[FIBER_LAYERS];        // [ffn_dim, dim]
+    float *w2_f32[FIBER_LAYERS];        // [dim, ffn_dim]
+    float *ffn_norm_f32[FIBER_LAYERS];  // [dim]
     // Global
     _Float16 *embedding;    // [vocab, dim]
     _Float16 *output_norm;  // [dim]

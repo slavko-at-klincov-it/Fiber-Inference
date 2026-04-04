@@ -70,3 +70,58 @@ void amx_forward_ffn_batch(_Float16 *x, int dim, int ffn_dim, int seq,
     }
     free(xf); free(ffn_out);
 }
+
+// FP32 weights version — skips per-call FP16→FP32 conversion
+void amx_forward_ffn_batch_f32(_Float16 *x, int dim, int ffn_dim, int seq,
+                                const float *w1, const float *w3,
+                                const float *w2, const float *ffn_norm,
+                                float eps) {
+    size_t ds = (size_t)dim * seq;
+    size_t fs = (size_t)ffn_dim * seq;
+
+    // Convert x FP16 → FP32
+    float *xf = malloc(ds * sizeof(float));
+    for (size_t i = 0; i < ds; i++) xf[i] = (float)x[i];
+
+    // RMSNorm per token
+    float *xnorm = malloc(ds * sizeof(float));
+    for (int t = 0; t < seq; t++) {
+        float ss = 0;
+        for (int d = 0; d < dim; d++) {
+            float v = xf[(size_t)d * seq + t];
+            ss += v * v;
+        }
+        float rrms = 1.0f / sqrtf(ss / dim + eps);
+        for (int d = 0; d < dim; d++) {
+            xnorm[(size_t)d * seq + t] = xf[(size_t)d * seq + t] * rrms * ffn_norm[d];
+        }
+    }
+
+    // Matmuls — weights already FP32, no conversion needed
+    float *h1 = malloc(fs * sizeof(float));
+    float *h3 = malloc(fs * sizeof(float));
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                ffn_dim, seq, dim, 1.0f, w1, dim, xnorm, seq, 0.0f, h1, seq);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                ffn_dim, seq, dim, 1.0f, w3, dim, xnorm, seq, 0.0f, h3, seq);
+    free(xnorm);
+
+    // SiLU gate
+    for (size_t i = 0; i < fs; i++) {
+        float s = h1[i] / (1.0f + expf(-h1[i]));
+        h1[i] = s * h3[i];
+    }
+    free(h3);
+
+    // W2 matmul
+    float *ffn_out = malloc(ds * sizeof(float));
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                dim, seq, ffn_dim, 1.0f, w2, ffn_dim, h1, seq, 0.0f, ffn_out, seq);
+    free(h1);
+
+    // Residual + FP16
+    for (size_t i = 0; i < ds; i++) {
+        x[i] = (_Float16)(xf[i] + ffn_out[i]);
+    }
+    free(xf); free(ffn_out);
+}

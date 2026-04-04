@@ -189,9 +189,9 @@ static void run_fiber768_bench(void) {
 
         // AMX FFN
         uint64_t tf = timer_now();
-        amx_forward_ffn_batch(x, dim, FIBER_FFN_DIM, seq,
-                               fm->w1[l], fm->w3[l], fm->w2[l],
-                               fm->ffn_norm[l], FIBER_RMS_EPS);
+        amx_forward_ffn_batch_f32(x, dim, FIBER_FFN_DIM, seq,
+                                   fm->w1_f32[l], fm->w3_f32[l], fm->w2_f32[l],
+                                   fm->ffn_norm_f32[l], FIBER_RMS_EPS);
         amx_total += timer_ms(tf, timer_now());
     }
 

@@ -14,4 +14,10 @@ void amx_forward_ffn_batch(_Float16 *x, int dim, int ffn_dim, int seq,
                             const _Float16 *w2, const _Float16 *ffn_norm,
                             float eps);
 
+// FP32 weights version — no per-call conversion needed (pre-converted at init)
+void amx_forward_ffn_batch_f32(_Float16 *x, int dim, int ffn_dim, int seq,
+                                const float *w1, const float *w3,
+                                const float *w2, const float *ffn_norm,
+                                float eps);
+
 #endif

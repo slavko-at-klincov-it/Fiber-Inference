@@ -85,8 +85,27 @@ Aber im Fiber-768 Benchmark (seq=256): AMX = 4.68ms/Layer
 
 3. **GPU fuer Decode** nutzen (ANE+AMX fuer Prefill, GPU fuer Decode)
 
+## Pre-Convert FP32 Weights [TESTED]
+
+**Ergebnis:** Kein messbarer Speedup (4.68 → 4.54 ms/Layer, ~3% Unterschied).
+
+Die FP16→FP32 Konvertierung war NICHT der AMX FFN Bottleneck.
+**cblas_sgemm Compute-Zeit selbst dominiert** — AMX laeuft bei ~1600 GFLOPS,
+das ist nahe am Peak fuer diese Matrixgroessen.
+
+| Config | AMX FFN ms/Layer | Total tok/s |
+|--------|-----------------|-------------|
+| FP16 Weights (pro Layer konvertiert) | 4.68 | 1962 |
+| FP32 Weights (pre-converted) | 4.54 | 2010 |
+
+**Fazit:** AMX FFN ist compute-bound, nicht conversion-bound.
+Weitere Speedups brauchen entweder:
+- ANE fuer FFN (gdc-lm: 9.6 TFLOPS auf ANE, 6x mehr als AMX)
+- GPU fuer FFN bei grossem seq (GPU wird effizienter bei seq > 256)
+- Beide parallel
+
 ## Offene Fragen
 
-- Wie schnell ist AMX FFN mit vorkonvertierten FP32 Weights?
 - Kann ANE FFN schneller sein als AMX FFN? (gdc-lm: 9.6 TFLOPS reine FFN auf ANE)
+- Kann ANE Attention + ANE FFN fused werden? (gdc-lm: 5 Layers/Kernel)
 - Wie verhaelt sich die Qualitaet mit trainierten Weights vs Random?

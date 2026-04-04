@@ -15,7 +15,7 @@ struct gpu_context {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
 
-    id<MTLComputePipelineState> pipe_q4k, pipe_q5k, pipe_q6k;
+    id<MTLComputePipelineState> pipe_q4k, pipe_q5k, pipe_q6k, pipe_q4k_mr;
     id<MTLComputePipelineState> pipe_q4k_f32, pipe_q6k_f32;  // F32 output for classifier
     id<MTLComputePipelineState> pipe_rmsnorm, pipe_silu, pipe_residual;
     id<MTLComputePipelineState> pipe_rope_qk, pipe_kv_store, pipe_attention;
@@ -60,7 +60,7 @@ static id<MTLBuffer> make_buf(id<MTLDevice> d, size_t n) {
 }
 
 static id<MTLComputePipelineState> pipe_for_type(gpu_context_t *c, ggml_type_t t) {
-    if (t == GGML_TYPE_Q4_K) return c->pipe_q4k;
+    if (t == GGML_TYPE_Q4_K) return c->pipe_q4k; // Multi-row has bug, revert to original
     if (t == GGML_TYPE_Q5_K) return c->pipe_q5k;
     if (t == GGML_TYPE_Q6_K) return c->pipe_q6k;
     return c->pipe_q4k;
@@ -75,17 +75,41 @@ static size_t woff(const gpu_context_t *c, const void *p) {
     return (const uint8_t *)p - (const uint8_t *)c->mmap_base;
 }
 
-// Encode matvec (FP16 output)
-static void enc_mv(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p,
-                   id<MTLBuffer> wb, size_t wo, id<MTLBuffer> in, id<MTLBuffer> out,
-                   int id_dim, int od) {
+// Encode matvec — detects multi-row pipeline and adjusts dispatch
+static void enc_mv_with_ctx(id<MTLComputeCommandEncoder> e, gpu_context_t *c,
+                             id<MTLComputePipelineState> p,
+                             id<MTLBuffer> wb, size_t wo, id<MTLBuffer> in, id<MTLBuffer> out,
+                             int id_dim, int od) {
     [e setComputePipelineState:p];
     [e setBuffer:wb offset:wo atIndex:0];
     [e setBuffer:in offset:0 atIndex:1];
     [e setBuffer:out offset:0 atIndex:2];
     [e setBytes:&id_dim length:4 atIndex:3];
     [e setBytes:&od length:4 atIndex:4];
-    [e dispatchThreadgroups:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    if (p == c->pipe_q4k_mr) {
+        // Multi-row: 4 rows per threadgroup
+        int tg_count = (od + 3) / 4;
+        [e dispatchThreadgroups:MTLSizeMake(tg_count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    } else {
+        // Single-row: 1 row per threadgroup (Q5_K, Q6_K, etc.)
+        [e dispatchThreadgroups:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    }
+}
+// Convenience macro
+#define enc_mv(e, p, wb, wo, in, out, id, od) enc_mv_with_ctx(e, c, p, wb, wo, in, out, id, od)
+
+// Multi-row matvec: 4 rows per threadgroup, input shared via threadgroup memory
+static void enc_mv_mr(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p,
+                      id<MTLBuffer> wb, size_t wo, id<MTLBuffer> in, id<MTLBuffer> out,
+                      int id_dim, int od) {
+    [e setComputePipelineState:p];
+    [e setBuffer:wb offset:wo atIndex:0];
+    [e setBuffer:in offset:0 atIndex:1];
+    [e setBuffer:out offset:0 atIndex:2];
+    [e setBytes:&id_dim length:4 atIndex:3];
+    [e setBytes:&od length:4 atIndex:4];
+    int tg_count = (od + 3) / 4; // 4 rows per threadgroup
+    [e dispatchThreadgroups:MTLSizeMake(tg_count,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
 }
 
 static void enc_rms(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> p,
@@ -134,6 +158,7 @@ gpu_context_t *gpu_init(const model_t *m) {
         if (!lib) { fprintf(stderr, "gpu: compile: %s\n", [[err description] UTF8String]); free(c); return NULL; }
 
         c->pipe_q4k      = mp(lib, @"q4k_matvec");
+        c->pipe_q4k_mr   = mp(lib, @"q4k_matvec_mr");
         c->pipe_q5k      = mp(lib, @"q5k_matvec");
         c->pipe_q6k      = mp(lib, @"q6k_matvec");
         c->pipe_q4k_f32  = mp(lib, @"q4k_matvec_f32");

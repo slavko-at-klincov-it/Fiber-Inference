@@ -40,7 +40,72 @@ static inline float simd_reduce_sum(float val, uint tid, threadgroup float *shar
 }
 
 // ============================================================
-// Q4_K Fused Dequant + MatVec — FP16 in, FP16 out
+// Q4_K Multi-Row MatVec — processes 4 rows per threadgroup
+// Input vector loaded once into threadgroup memory, reused across rows.
+// 256 threads = 4 rows × 64 threads/row (2 SIMD groups per row)
+// ============================================================
+kernel void q4k_matvec_mr(
+    device const uint8_t *weight [[buffer(0)]],
+    device const half *input      [[buffer(1)]],
+    device half *output            [[buffer(2)]],
+    constant int &in_dim           [[buffer(3)]],
+    constant int &out_dim          [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    const int ROWS_PER_TG = 4;
+    const int THREADS_PER_ROW = 64; // 2 SIMD groups
+    int local_row = int(tid) / THREADS_PER_ROW;
+    int local_tid = int(tid) % THREADS_PER_ROW;
+    int row = int(tgid) * ROWS_PER_TG + local_row;
+
+    if (row >= out_dim) return;
+
+    const int bpr = in_dim / 256;
+
+    // Load input into threadgroup memory (shared across 4 rows)
+    threadgroup half tg_input[2048]; // max in_dim we support
+    for (int i = int(tid); i < in_dim; i += 256) {
+        tg_input[i] = input[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute dot product for this row
+    device const uint8_t *rb = weight + uint64_t(row) * bpr * 144;
+    float sum = 0.0f;
+
+    // Each thread processes 4 elements per block (64 threads × 4 = 256 per block)
+    for (int b = 0; b < bpr; b++) {
+        device const uint8_t *bl = rb + b * 144;
+        float d = float(*(device const half *)bl);
+        float dm = float(*(device const half *)(bl + 2));
+        device const uint8_t *sc = bl + 4, *qs = bl + 16;
+
+        // Process 4 elements per thread (256 elements / 64 threads)
+        for (int sub = 0; sub < 4; sub++) {
+            int e = local_tid + sub * 64;
+            int g = e/64, s = (e/32)&1, w = e%32;
+            float sv, mv;
+            get_scale_min_k4(g*2+s, sc, sv, mv);
+            float val = d * sv * float(s==0 ? (qs[g*32+w]&0xF) : (qs[g*32+w]>>4)) - dm * mv;
+            sum += val * float(tg_input[b*256+e]);
+        }
+    }
+
+    // Reduce within the 64-thread row group (2 SIMD groups)
+    float simd_total = simd_sum(sum);
+    threadgroup float row_shared[8]; // 2 simd groups per row × 4 rows
+    int simd_idx = local_tid / 32;
+    if ((local_tid & 31) == 0) row_shared[local_row * 2 + simd_idx] = simd_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (local_tid == 0) {
+        float result = row_shared[local_row * 2] + row_shared[local_row * 2 + 1];
+        output[row] = half(result);
+    }
+}
+
+// ============================================================
+// Q4_K Fused Dequant + MatVec — FP16 in, FP16 out (original, 1 row/tg)
 // ============================================================
 kernel void q4k_matvec(
     device const uint8_t *weight [[buffer(0)]],

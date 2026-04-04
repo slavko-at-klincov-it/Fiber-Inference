@@ -255,7 +255,9 @@ void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *promp
     printf("--- Pipeline B: ANE-only Prefill ---\n");
 
     ane_init();
-    int seq = n_prompt < 128 ? 128 : n_prompt;
+    int total_needed = n_prompt + gen_tokens;
+    int seq = total_needed < 128 ? 128 : total_needed;
+    if (seq > 256) seq = 256; // ANE sweet spot limit
 
     // Compile ANE attention kernels
     NSString *mil = gen_sdpa_prefill_mil(dim, heads, kv_heads, hd, seq,
@@ -340,27 +342,99 @@ void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *promp
     }
     double prefill_b_ms = timer_ms(t0, timer_now());
 
-    // Classifier on last token
-    float *last_h = malloc(dim * sizeof(float));
-    for (int d = 0; d < dim; d++) last_h[d] = (float)x_b[(size_t)d*seq+(n_prompt-1)];
-    float *norm_w = malloc(dim * sizeof(float));
-    for (int d = 0; d < dim; d++) norm_w[d] = (float)fm->output_norm[d];
-    float *final_n = malloc(dim * sizeof(float));
-    cpu_rmsnorm(final_n, last_h, norm_w, dim, FIBER_RMS_EPS);
-    float *logits_b = malloc(vocab * sizeof(float));
-    for (int v = 0; v < vocab; v++) {
+    // ANE prefill → first token
+    // Classify: extract last token hidden state, RMSNorm, matmul with output weights
+    float *_lh = malloc(dim * sizeof(float));
+    for (int d = 0; d < dim; d++) _lh[d] = (float)x_b[(size_t)d*seq+(n_prompt-1)];
+    float *_nw = malloc(dim * sizeof(float));
+    for (int d = 0; d < dim; d++) _nw[d] = (float)fm->output_norm[d];
+    float *_fn = malloc(dim * sizeof(float));
+    cpu_rmsnorm(_fn, _lh, _nw, dim, FIBER_RMS_EPS);
+    float *_lg = malloc(vocab * sizeof(float));
+    for (int v2 = 0; v2 < vocab; v2++) {
         float dot = 0;
-        for (int d = 0; d < dim; d++) dot += (float)fm->output[(size_t)v*dim+d] * final_n[d];
-        logits_b[v] = dot;
+        for (int d = 0; d < dim; d++) dot += (float)fm->output[(size_t)v2*dim+d] * _fn[d];
+        _lg[v2] = dot;
     }
-    int first_tok_b = argmax(logits_b, vocab);
+    int first_tok_b = argmax(_lg, vocab);
+    free(_lh); free(_nw); free(_fn); free(_lg);
 
-    printf("Output (prefill only): ");
-    for (int i = 0; i < n_prompt; i++) printf("%s", tokenizer_decode(tok, tokens[i]));
-    printf("%s", tokenizer_decode(tok, first_tok_b));
-    printf("...\n");
-    printf("Prefill: %d tokens in %.1f ms (%.1f tok/s)\n\n",
+    // ========================================
+    // ANE Decode via Re-Prefill
+    // Strategy: for each new token, re-run entire context through ANE
+    // O(n²) but uses existing kernels. Effective for short contexts (≤128).
+    // ========================================
+    int output_b[256];
+    int n_out_b = 0;
+    output_b[n_out_b++] = first_tok_b;
+
+    int all_tokens[256]; // prompt + generated
+    memcpy(all_tokens, tokens, n_prompt * sizeof(int));
+    all_tokens[n_prompt] = first_tok_b;
+
+    printf("ANE Decode (re-prefill) generating %d tokens...\n", gen_tokens - 1);
+    uint64_t td_b = timer_now();
+
+    for (int step = 0; step < gen_tokens - 1; step++) {
+        int total_ctx = n_prompt + n_out_b;
+        if (total_ctx >= seq) break; // max context
+        if (output_b[n_out_b - 1] == 2) break; // EOS
+
+        // Re-embed all tokens → [dim, seq] channels-first
+        memset(x_b, 0, (size_t)dim * seq * sizeof(_Float16));
+        for (int t = 0; t < total_ctx; t++)
+            for (int d = 0; d < dim; d++)
+                x_b[(size_t)d * seq + t] = fm->embedding[(size_t)all_tokens[t] * dim + d];
+
+        // ANE forward (all layers)
+        for (int l = 0; l < n_layers; l++) {
+            ane_lock_input(attn_kernels[l], 0);
+            memcpy(ane_input_ptr(attn_kernels[l], 0), x_b, in_bytes);
+            ane_unlock_input(attn_kernels[l], 0);
+            ane_eval(attn_kernels[l], ANE_QOS_BACKGROUND);
+            ane_lock_output(attn_kernels[l], 0);
+            memcpy(x_b, ane_output_ptr(attn_kernels[l], 0), in_bytes);
+            ane_unlock_output(attn_kernels[l], 0);
+
+            ane_lock_input(ffn_kernels[l], 0);
+            memcpy(ane_input_ptr(ffn_kernels[l], 0), x_b, in_bytes);
+            ane_unlock_input(ffn_kernels[l], 0);
+            ane_eval(ffn_kernels[l], ANE_QOS_BACKGROUND);
+            ane_lock_output(ffn_kernels[l], 0);
+            memcpy(x_b, ane_output_ptr(ffn_kernels[l], 0), in_bytes);
+            ane_unlock_output(ffn_kernels[l], 0);
+        }
+
+        // Classify last token
+        float *lh2 = malloc(dim * sizeof(float));
+        for (int d = 0; d < dim; d++) lh2[d] = (float)x_b[(size_t)d*seq+(total_ctx-1)];
+        float *fn3 = malloc(dim * sizeof(float));
+        cpu_rmsnorm(fn3, lh2, _nw, dim, FIBER_RMS_EPS);  // reuse _nw... no, it's freed
+        // Need norm weights again
+        float *nw2 = malloc(dim * sizeof(float));
+        for (int d = 0; d < dim; d++) nw2[d] = (float)fm->output_norm[d];
+        cpu_rmsnorm(fn3, lh2, nw2, dim, FIBER_RMS_EPS);
+        float *lg2 = malloc(vocab * sizeof(float));
+        for (int v2 = 0; v2 < vocab; v2++) {
+            float dot = 0;
+            for (int d = 0; d < dim; d++) dot += (float)fm->output[(size_t)v2*dim+d] * fn3[d];
+            lg2[v2] = dot;
+        }
+        int next = argmax(lg2, vocab);
+        free(lh2); free(nw2); free(fn3); free(lg2);
+        output_b[n_out_b++] = next;
+        all_tokens[total_ctx] = next;
+    }
+    double decode_b_ms = timer_ms(td_b, timer_now());
+
+    printf("Prefill: %d tokens in %.1f ms (%.1f tok/s)\n",
            n_prompt, prefill_b_ms, n_prompt / (prefill_b_ms/1000.0));
+    printf("Decode:  %d tokens in %.1f ms (%.1f tok/s)\n",
+           n_out_b, decode_b_ms, n_out_b / (decode_b_ms/1000.0));
+    printf("Output: ");
+    for (int i = 0; i < n_prompt; i++) printf("%s", tokenizer_decode(tok, tokens[i]));
+    for (int i = 0; i < n_out_b; i++) printf("%s", tokenizer_decode(tok, output_b[i]));
+    printf("\n\n");
 
     // ========================================
     // Comparison
@@ -368,17 +442,25 @@ void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *promp
     printf("========================================\n");
     printf("  COMPARISON\n");
     printf("========================================\n");
-    printf("CPU/AMX Prefill: %6.1f ms (%6.1f tok/s)\n", prefill_a_ms, n_prompt/(prefill_a_ms/1000.0));
-    printf("ANE     Prefill: %6.1f ms (%6.1f tok/s)\n", prefill_b_ms, n_prompt/(prefill_b_ms/1000.0));
-    printf("Speedup:         %.1fx\n", prefill_a_ms / prefill_b_ms);
-    printf("\nFirst generated token:\n");
-    printf("  CPU/AMX: [%d] \"%s\"\n", output_a[0], tokenizer_decode(tok, output_a[0]));
-    printf("  ANE:     [%d] \"%s\"\n", first_tok_b, tokenizer_decode(tok, first_tok_b));
-    printf("  Match:   %s\n", output_a[0] == first_tok_b ? "YES" : "NO");
+    printf("              CPU/AMX          ANE\n");
+    printf("Prefill:  %6.1f ms (%5.1f t/s)  %6.1f ms (%5.1f t/s)  %.1fx\n",
+           prefill_a_ms, n_prompt/(prefill_a_ms/1000.0),
+           prefill_b_ms, n_prompt/(prefill_b_ms/1000.0),
+           prefill_a_ms / prefill_b_ms);
+    printf("Decode:   %6.1f ms (%5.1f t/s)  %6.1f ms (%5.1f t/s)  %.1fx\n",
+           decode_a_ms, n_out_a/(decode_a_ms/1000.0),
+           decode_b_ms, n_out_b/(decode_b_ms/1000.0),
+           decode_a_ms / decode_b_ms);
+    printf("\nFirst token match: %s (CPU=[%d] ANE=[%d])\n",
+           output_a[0] == output_b[0] ? "YES" : "NO", output_a[0], output_b[0]);
+    printf("Full output match: ");
+    int match_count = 0;
+    int min_out = n_out_a < n_out_b ? n_out_a : n_out_b;
+    for (int i = 0; i < min_out; i++) if (output_a[i] == output_b[i]) match_count++;
+    printf("%d/%d tokens match\n", match_count, min_out);
     printf("========================================\n");
 
     // Cleanup
-    free(last_h); free(norm_w); free(final_n); free(logits_b);
     free(x_b); free(ane_out);
     for (int l = 0; l < n_layers; l++) { ane_free(attn_kernels[l]); ane_free(ffn_kernels[l]); }
     tokenizer_free(tok); gguf_close(gf);

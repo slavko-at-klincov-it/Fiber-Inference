@@ -151,9 +151,11 @@ static NSString *gen_sdpa_prefill_mil(int dim, int n_heads, int n_kv_heads,
     [m appendFormat:@"        tensor<fp16, [1,%d,%d,%d]> at = transpose(perm=pm,x=a4)[name=string(\"ta\")];\n", attn_heads, head_dim, seq];
     [m appendFormat:@"        tensor<int32, [4]> os = const()[name=string(\"os\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", dim, seq];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> af = reshape(shape=os,x=at)[name=string(\"ra\")];\n", dim, seq];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> oo = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=af)[name=string(\"co\")];\n", dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> wo_out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wo,x=af)[name=string(\"co\")];\n", dim, seq];
+    // Residual: oo = x + wo_out (attention residual inside ANE)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> oo = add(x=x,y=wo_out)[name=string(\"ares\")];\n", dim, seq];
 
-    // === Output: concat(wo_out, k_roped_flat, v_flat) for KV-cache ===
+    // === Output: concat(attn_residual, k_roped_flat, v_flat) for KV-cache ===
     // Flatten k_rot back to [1, kv_dim, 1, seq] and v4 to same
     [m appendFormat:@"        tensor<int32, [4]> kvflat = const()[name=string(\"kvflat\"), val=tensor<int32, [4]>([1,%d,1,%d])];\n", kv_dim, seq];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> kout = reshape(shape=kvflat,x=k_rot)[name=string(\"kout\")];\n", kv_dim, seq];
@@ -210,7 +212,10 @@ static NSString *gen_ffn_only_mil(int dim, int ffn_dim, int seq, float rms_eps) 
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sg = sigmoid(x=h1)[name=string(\"sg\")];\n", ffn_dim, seq];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> si = mul(x=h1,y=sg)[name=string(\"si\")];\n", ffn_dim, seq];
     [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gt = mul(x=si,y=h3)[name=string(\"gt\")];\n", ffn_dim, seq];
-    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gt)[name=string(\"c2\")];\n", dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> ffn_out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gt)[name=string(\"c2\")];\n", dim, seq];
+
+    // Residual: output = input + ffn_out
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = add(x=x,y=ffn_out)[name=string(\"res\")];\n", dim, seq];
 
     [m appendString:@"    } -> (out);\n}\n"];
     return m;

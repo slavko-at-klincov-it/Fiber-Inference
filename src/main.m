@@ -183,9 +183,8 @@ static void run_fiber768_bench(void) {
         ane_unlock_output(kernels[l], 0);
         ane_total += timer_ms(ta, timer_now());
 
-        // Residual
-        for (size_t i = 0; i < (size_t)dim * seq; i++)
-            x[i] += ane_out[i];
+        // Attention output now includes residual
+        memcpy(x, ane_out, (size_t)dim * seq * sizeof(_Float16));
 
         // AMX FFN
         uint64_t tf = timer_now();
@@ -264,24 +263,19 @@ static void run_fiber768_bench(void) {
             ane_unlock_output(kernels[l], 0);
             ane_attn2 += timer_ms(ta, timer_now());
 
-            // Residual (attn output is first dim channels)
-            for (size_t i = 0; i < (size_t)dim * seq; i++)
-                x[i] += ane_out[i];
+            // Attention output now includes residual: oo = x + attn(x)
+            // Extract x_after_attn from first dim channels of ane_out
+            memcpy(x, ane_out, (size_t)dim * seq * sizeof(_Float16));
 
-            // ANE FFN
+            // ANE FFN (output includes residual: out = x + ffn(x))
             uint64_t tf = timer_now();
-            _Float16 *ffn_result = calloc(dim * seq, sizeof(_Float16));
             ane_lock_input(ffn_kernels[l], 0);
             memcpy(ane_input_ptr(ffn_kernels[l], 0), x, in_bytes);
             ane_unlock_input(ffn_kernels[l], 0);
             ane_eval(ffn_kernels[l], ANE_QOS_BACKGROUND);
             ane_lock_output(ffn_kernels[l], 0);
-            memcpy(ffn_result, ane_output_ptr(ffn_kernels[l], 0), ffn_out_bytes);
+            memcpy(x, ane_output_ptr(ffn_kernels[l], 0), ffn_out_bytes);
             ane_unlock_output(ffn_kernels[l], 0);
-            // Residual
-            for (size_t i = 0; i < (size_t)dim * seq; i++)
-                x[i] += ffn_result[i];
-            free(ffn_result);
             ane_ffn2 += timer_ms(tf, timer_now());
         }
 

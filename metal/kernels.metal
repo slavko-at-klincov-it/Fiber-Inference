@@ -286,6 +286,34 @@ kernel void rmsnorm(
 }
 
 // ============================================================
+// Fused Residual + RMSNorm: x += y, then out = rmsnorm(x) * w
+// Combines residual_add + rmsnorm into one dispatch
+// ============================================================
+kernel void residual_rmsnorm(
+    device half *x          [[buffer(0)]],   // [dim] — modified in-place (residual added)
+    device const half *y    [[buffer(1)]],   // [dim] — residual to add
+    device const float *w   [[buffer(2)]],   // [dim] — norm weights (F32 from model buffer)
+    device half *out        [[buffer(3)]],   // [dim] — normalized output
+    constant int &dim       [[buffer(4)]],
+    constant float &eps     [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    // Step 1: Residual add (x += y)
+    for (int i = int(tid); i < dim; i += 256)
+        x[i] = half(float(x[i]) + float(y[i]));
+    threadgroup_barrier(mem_flags::mem_device);
+
+    // Step 2: RMSNorm on updated x
+    threadgroup float shared[8];
+    float ss = 0.0f;
+    for (int i = int(tid); i < dim; i += 256) ss += float(x[i]) * float(x[i]);
+    float total = simd_reduce_sum(ss, tid, shared);
+    float rrms = 1.0f / sqrt(total / float(dim) + eps);
+    for (int i = int(tid); i < dim; i += 256)
+        out[i] = half(float(x[i]) * rrms * w[i]);
+}
+
+// ============================================================
 // Batched RMSNorm — channels-first [dim, seq] layout
 // One thread per token, loops over dim
 // ============================================================

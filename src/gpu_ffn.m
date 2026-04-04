@@ -17,7 +17,7 @@ struct gpu_context {
 
     id<MTLComputePipelineState> pipe_q4k, pipe_q5k, pipe_q6k, pipe_q4k_mr;
     id<MTLComputePipelineState> pipe_q4k_f32, pipe_q6k_f32;  // F32 output for classifier
-    id<MTLComputePipelineState> pipe_rmsnorm, pipe_silu, pipe_residual;
+    id<MTLComputePipelineState> pipe_rmsnorm, pipe_silu, pipe_residual, pipe_res_rmsnorm;
     id<MTLComputePipelineState> pipe_rope_qk, pipe_kv_store, pipe_attention;
     id<MTLComputePipelineState> pipe_rmsnorm_batch;
 
@@ -167,6 +167,7 @@ gpu_context_t *gpu_init(const model_t *m) {
         c->pipe_rmsnorm_batch = mp(lib, @"rmsnorm_batch");
         c->pipe_silu          = mp(lib, @"silu_gate");
         c->pipe_residual      = mp(lib, @"residual_add");
+        c->pipe_res_rmsnorm   = mp(lib, @"residual_rmsnorm");
         c->pipe_rope_qk   = mp(lib, @"rope_qk");
         c->pipe_kv_store  = mp(lib, @"kv_store_kv");
         c->pipe_attention  = mp(lib, @"attention_decode");
@@ -559,18 +560,21 @@ double gpu_forward_token(gpu_context_t *c, const model_t *m,
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             }
 
-            // Wo + residual
+            // Wo projection
             enc_mv(enc, pipe_for_type(c, lw.wo_type), c->buf_model, woff(c, lw.wo),
                    c->buf_attn_out, c->buf_proj, dim, dim);
-            [enc setComputePipelineState:c->pipe_residual];
+
+            // Fused: x += proj, then xnorm = rmsnorm(x) — saves 1 dispatch
+            [enc setComputePipelineState:c->pipe_res_rmsnorm];
             [enc setBuffer:c->buf_x offset:0 atIndex:0];
             [enc setBuffer:c->buf_proj offset:0 atIndex:1];
-            [enc setBytes:&dim length:4 atIndex:2];
-            [enc dispatchThreads:MTLSizeMake(dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc setBuffer:c->buf_model offset:woff(c, lw.ffn_norm) atIndex:2];
+            [enc setBuffer:c->buf_xnorm offset:0 atIndex:3];
+            [enc setBytes:&dim length:4 atIndex:4];
+            [enc setBytes:&eps length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
 
-            // FFN: RMSNorm → W1,W3 → SiLU → W2 → residual
-            enc_rms(enc, c->pipe_rmsnorm, c->buf_x, c->buf_model, woff(c, lw.ffn_norm),
-                    c->buf_xnorm, dim, eps);
+            // FFN: W1,W3 → SiLU → W2 → residual
             enc_mv(enc, pipe_for_type(c, lw.w1_type), c->buf_model, woff(c, lw.w1),
                    c->buf_xnorm, c->buf_h1, dim, ffn);
             enc_mv(enc, pipe_for_type(c, lw.w3_type), c->buf_model, woff(c, lw.w3),

@@ -43,9 +43,14 @@ struct gpu_context {
     id<MTLBuffer> __strong *buf_w2_fp16;      // [n_layers] each [dim, ffn] FP16
     id<MTLBuffer> __strong *buf_rms_ffn_fp16; // [n_layers] each [dim] FP16
     bool ffn_weights_ready;
-    // MPS matrix multiply objects
+    // Cached MPS objects (created once in gpu_init_ffn_batch)
     MPSMatrixMultiplication *mps_mul_hd; // [ffn,dim] × [dim,seq] → [ffn,seq]
     MPSMatrixMultiplication *mps_mul_dh; // [dim,ffn] × [ffn,seq] → [dim,seq]
+    MPSMatrix *mat_xnorm_cached, *mat_h1_cached, *mat_h3_cached;
+    MPSMatrix *mat_silu_cached, *mat_ffn_out_cached;
+    MPSMatrix *__strong *mat_w1_cached;  // [n_layers]
+    MPSMatrix *__strong *mat_w3_cached;  // [n_layers]
+    MPSMatrix *__strong *mat_w2_cached;  // [n_layers]
 
     model_params_t params;
 };
@@ -316,32 +321,18 @@ bool gpu_init_ffn_batch(gpu_context_t *c, const model_t *m, int max_seq) {
         }
         c->ffn_weights_ready = true;
 
-        // MPS MatrixMultiplication objects
+        // Cached MPS objects (created once, reused every layer)
         c->mps_mul_hd = [[MPSMatrixMultiplication alloc]
             initWithDevice:c->device resultRows:ffn resultColumns:max_seq interiorColumns:dim];
         c->mps_mul_dh = [[MPSMatrixMultiplication alloc]
             initWithDevice:c->device resultRows:dim resultColumns:max_seq interiorColumns:ffn];
 
-        printf("GPU batch FFN: pre-dequant %.1f MB in %.1f ms, max_seq=%d\n",
-               total_bytes / (1024.0*1024.0), timer_ms(td, timer_now()), max_seq);
-        return true;
-    }
-}
-
-void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
-                            uint32_t layer_idx, _Float16 *x, int seq) {
-    @autoreleasepool {
-        int dim = c->params.dim, ffn = c->params.ffn_dim;
-
-        // Copy x (channels-first [dim, seq]) into GPU batch buffer
-        memcpy(c->buf_x_batch.contents, x, (size_t)dim * seq * sizeof(_Float16));
-
-        // MPS matrix descriptors and wrappers
+        // Descriptors
         MPSMatrixDescriptor *desc_x = [MPSMatrixDescriptor
-            matrixDescriptorWithRows:dim columns:seq rowBytes:seq*2
+            matrixDescriptorWithRows:dim columns:max_seq rowBytes:max_seq*2
             dataType:MPSDataTypeFloat16];
         MPSMatrixDescriptor *desc_h = [MPSMatrixDescriptor
-            matrixDescriptorWithRows:ffn columns:seq rowBytes:seq*2
+            matrixDescriptorWithRows:ffn columns:max_seq rowBytes:max_seq*2
             dataType:MPSDataTypeFloat16];
         MPSMatrixDescriptor *desc_w_hd = [MPSMatrixDescriptor
             matrixDescriptorWithRows:ffn columns:dim rowBytes:dim*2
@@ -350,78 +341,96 @@ void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
             matrixDescriptorWithRows:dim columns:ffn rowBytes:ffn*2
             dataType:MPSDataTypeFloat16];
 
-        MPSMatrix *mat_xnorm = [[MPSMatrix alloc] initWithBuffer:c->buf_xnorm_batch descriptor:desc_x];
-        MPSMatrix *mat_w1 = [[MPSMatrix alloc] initWithBuffer:c->buf_w1_fp16[layer_idx] descriptor:desc_w_hd];
-        MPSMatrix *mat_w3 = [[MPSMatrix alloc] initWithBuffer:c->buf_w3_fp16[layer_idx] descriptor:desc_w_hd];
-        MPSMatrix *mat_w2 = [[MPSMatrix alloc] initWithBuffer:c->buf_w2_fp16[layer_idx] descriptor:desc_w_dh];
-        MPSMatrix *mat_h1 = [[MPSMatrix alloc] initWithBuffer:c->buf_h1_batch descriptor:desc_h];
-        MPSMatrix *mat_h3 = [[MPSMatrix alloc] initWithBuffer:c->buf_h3_batch descriptor:desc_h];
-        MPSMatrix *mat_silu = [[MPSMatrix alloc] initWithBuffer:c->buf_silu_batch descriptor:desc_h];
-        MPSMatrix *mat_out = [[MPSMatrix alloc] initWithBuffer:c->buf_ffn_out descriptor:desc_x];
+        // Shared activation matrix wrappers
+        c->mat_xnorm_cached  = [[MPSMatrix alloc] initWithBuffer:c->buf_xnorm_batch descriptor:desc_x];
+        c->mat_h1_cached     = [[MPSMatrix alloc] initWithBuffer:c->buf_h1_batch descriptor:desc_h];
+        c->mat_h3_cached     = [[MPSMatrix alloc] initWithBuffer:c->buf_h3_batch descriptor:desc_h];
+        c->mat_silu_cached   = [[MPSMatrix alloc] initWithBuffer:c->buf_silu_batch descriptor:desc_h];
+        c->mat_ffn_out_cached = [[MPSMatrix alloc] initWithBuffer:c->buf_ffn_out descriptor:desc_x];
 
-        MPSMatrixMultiplication *mul_hd = [[MPSMatrixMultiplication alloc]
-            initWithDevice:c->device resultRows:ffn resultColumns:seq interiorColumns:dim];
-        MPSMatrixMultiplication *mul_dh = [[MPSMatrixMultiplication alloc]
-            initWithDevice:c->device resultRows:dim resultColumns:seq interiorColumns:ffn];
-
-        id<MTLCommandBuffer> cb = [c->queue commandBuffer];
-        float eps = c->params.rms_norm_eps;
-        int n = dim * seq;
-        int nffn = ffn * seq;
-
-        // 1. RMSNorm batch
-        {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:c->pipe_rmsnorm_batch];
-            [enc setBuffer:c->buf_x_batch offset:0 atIndex:0];
-            [enc setBuffer:c->buf_rms_ffn_fp16[layer_idx] offset:0 atIndex:1];
-            [enc setBuffer:c->buf_xnorm_batch offset:0 atIndex:2];
-            [enc setBytes:&dim length:4 atIndex:3];
-            [enc setBytes:&seq length:4 atIndex:4];
-            [enc setBytes:&eps length:4 atIndex:5];
-            [enc dispatchThreads:MTLSizeMake(seq,1,1)
-                threadsPerThreadgroup:MTLSizeMake(MIN(256, seq),1,1)];
-            [enc endEncoding];
+        // Per-layer weight matrix wrappers
+        c->mat_w1_cached = (__strong MPSMatrix **)calloc(nl, sizeof(MPSMatrix *));
+        c->mat_w3_cached = (__strong MPSMatrix **)calloc(nl, sizeof(MPSMatrix *));
+        c->mat_w2_cached = (__strong MPSMatrix **)calloc(nl, sizeof(MPSMatrix *));
+        for (int l = 0; l < nl; l++) {
+            c->mat_w1_cached[l] = [[MPSMatrix alloc] initWithBuffer:c->buf_w1_fp16[l] descriptor:desc_w_hd];
+            c->mat_w3_cached[l] = [[MPSMatrix alloc] initWithBuffer:c->buf_w3_fp16[l] descriptor:desc_w_hd];
+            c->mat_w2_cached[l] = [[MPSMatrix alloc] initWithBuffer:c->buf_w2_fp16[l] descriptor:desc_w_dh];
         }
 
-        // 2. W1 @ xnorm and W3 @ xnorm (MPS matmul)
-        [mul_hd encodeToCommandBuffer:cb leftMatrix:mat_w1 rightMatrix:mat_xnorm resultMatrix:mat_h1];
-        [mul_hd encodeToCommandBuffer:cb leftMatrix:mat_w3 rightMatrix:mat_xnorm resultMatrix:mat_h3];
-
-        // 3. SiLU gate
-        {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:c->pipe_silu];
-            [enc setBuffer:c->buf_h1_batch offset:0 atIndex:0];
-            [enc setBuffer:c->buf_h3_batch offset:0 atIndex:1];
-            [enc setBuffer:c->buf_silu_batch offset:0 atIndex:2];
-            [enc setBytes:&nffn length:4 atIndex:3];
-            [enc dispatchThreads:MTLSizeMake(nffn,1,1)
-                threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [enc endEncoding];
-        }
-
-        // 4. W2 @ silu
-        [mul_dh encodeToCommandBuffer:cb leftMatrix:mat_w2 rightMatrix:mat_silu resultMatrix:mat_out];
-
-        // 5. Residual: x += ffn_out
-        {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:c->pipe_residual];
-            [enc setBuffer:c->buf_x_batch offset:0 atIndex:0];
-            [enc setBuffer:c->buf_ffn_out offset:0 atIndex:1];
-            [enc setBytes:&n length:4 atIndex:2];
-            [enc dispatchThreads:MTLSizeMake(n,1,1)
-                threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [enc endEncoding];
-        }
-
-        [cb commit];
-        [cb waitUntilCompleted];
-
-        // Copy result back to x
-        memcpy(x, c->buf_x_batch.contents, (size_t)dim * seq * sizeof(_Float16));
+        printf("GPU batch FFN: pre-dequant %.1f MB in %.1f ms, max_seq=%d, %d cached MPS objects\n",
+               total_bytes / (1024.0*1024.0), timer_ms(td, timer_now()), max_seq, 5 + nl*3);
+        return true;
     }
+}
+
+void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
+                            uint32_t layer_idx, _Float16 *x, int seq) {
+    int dim = c->params.dim, ffn = c->params.ffn_dim;
+    float eps = c->params.rms_norm_eps;
+    int n = dim * seq;
+    int nffn = ffn * seq;
+
+    // Copy x into GPU buffer
+    memcpy(c->buf_x_batch.contents, x, (size_t)n * sizeof(_Float16));
+
+    id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+
+    // 1. RMSNorm batch
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:c->pipe_rmsnorm_batch];
+        [enc setBuffer:c->buf_x_batch offset:0 atIndex:0];
+        [enc setBuffer:c->buf_rms_ffn_fp16[layer_idx] offset:0 atIndex:1];
+        [enc setBuffer:c->buf_xnorm_batch offset:0 atIndex:2];
+        [enc setBytes:&dim length:4 atIndex:3];
+        [enc setBytes:&seq length:4 atIndex:4];
+        [enc setBytes:&eps length:4 atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(seq,1,1)
+            threadsPerThreadgroup:MTLSizeMake(MIN(256, seq),1,1)];
+        [enc endEncoding];
+    }
+
+    // 2. W1 @ xnorm and W3 @ xnorm (cached MPS matmul)
+    [c->mps_mul_hd encodeToCommandBuffer:cb leftMatrix:c->mat_w1_cached[layer_idx]
+                               rightMatrix:c->mat_xnorm_cached resultMatrix:c->mat_h1_cached];
+    [c->mps_mul_hd encodeToCommandBuffer:cb leftMatrix:c->mat_w3_cached[layer_idx]
+                               rightMatrix:c->mat_xnorm_cached resultMatrix:c->mat_h3_cached];
+
+    // 3. SiLU gate
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:c->pipe_silu];
+        [enc setBuffer:c->buf_h1_batch offset:0 atIndex:0];
+        [enc setBuffer:c->buf_h3_batch offset:0 atIndex:1];
+        [enc setBuffer:c->buf_silu_batch offset:0 atIndex:2];
+        [enc setBytes:&nffn length:4 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(nffn,1,1)
+            threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+
+    // 4. W2 @ silu (cached MPS matmul)
+    [c->mps_mul_dh encodeToCommandBuffer:cb leftMatrix:c->mat_w2_cached[layer_idx]
+                               rightMatrix:c->mat_silu_cached resultMatrix:c->mat_ffn_out_cached];
+
+    // 5. Residual: x += ffn_out
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:c->pipe_residual];
+        [enc setBuffer:c->buf_x_batch offset:0 atIndex:0];
+        [enc setBuffer:c->buf_ffn_out offset:0 atIndex:1];
+        [enc setBytes:&n length:4 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n,1,1)
+            threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    // Copy result back
+    memcpy(x, c->buf_x_batch.contents, (size_t)n * sizeof(_Float16));
 }
 
 // ============================================================

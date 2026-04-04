@@ -322,16 +322,16 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
     int head_dim = m->params.head_dim;
     int kv_dim = n_kv_heads * head_dim;
     int out_ch = dim + 2 * kv_dim;
-    int seq = n_tokens;
+    int seq = n_tokens;  // actual token count
     int n_layers = m->params.n_layers;
+    int work_seq = ctx->max_prefill_seq; // padded working size (>= 128)
 
     // Limit to compiled max sequence length
-    if (seq > ctx->max_prefill_seq) seq = ctx->max_prefill_seq;
+    if (seq > work_seq) seq = work_seq;
 
     uint64_t t_embed = timer_now();
-    // 1. Embed all tokens → [dim, seq] FP16 (channels-first for ANE)
-    //    Layout: x[d * seq + t] = embedding[token_t][d]
-    _Float16 *x = calloc((size_t)dim * seq, sizeof(_Float16));
+    // 1. Embed all tokens → [dim, work_seq] FP16 (channels-first, zero-padded)
+    _Float16 *x = calloc((size_t)dim * work_seq, sizeof(_Float16));
     _Float16 *token_buf = calloc(dim, sizeof(_Float16));
     for (int t = 0; t < seq; t++) {
         // Dequant embedding for this token
@@ -349,33 +349,33 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
             default:
                 break;
         }
-        // Copy to channels-first: x[d][t]
+        // Copy to channels-first: x[d * work_seq + t]
         for (int d = 0; d < dim; d++) {
-            x[(size_t)d * seq + t] = token_buf[d];
+            x[(size_t)d * work_seq + t] = token_buf[d];
         }
     }
     free(token_buf);
 
     double embed_ms = timer_ms(t_embed, timer_now());
 
-    // Working buffers for ANE output
-    _Float16 *ane_out = calloc((size_t)out_ch * seq, sizeof(_Float16));
+    // Working buffers for ANE output (work_seq size for consistent MPS dimensions)
+    _Float16 *ane_out = calloc((size_t)out_ch * work_seq, sizeof(_Float16));
     double total_ane_ms = 0, total_ffn_ms = 0, total_kv_ms = 0, total_res_ms = 0;
 
     // 2. For each layer: ANE attention → residual → GPU FFN → residual
     for (int l = 0; l < n_layers; l++) {
         // a. ANE: full-batch attention (RMSNorm + QKV + RoPE + SDPA + Wo)
         uint64_t ta = timer_now();
-        bool ok = ane_attn_eval_layer(ctx, l, x, dim, seq, ane_out, out_ch);
+        bool ok = ane_attn_eval_layer(ctx, l, x, dim, work_seq, ane_out, out_ch);
         total_ane_ms += timer_ms(ta, timer_now());
         if (!ok) {
             fprintf(stderr, "ANE: prefill layer %d eval failed\n", l);
             break;
         }
 
-        // b. Residual add on CPU: x[d][t] += attn_out[d][t]
+        // b. Residual add on CPU (full work_seq width for consistency)
         uint64_t tr = timer_now();
-        for (size_t i = 0; i < (size_t)dim * seq; i++) {
+        for (size_t i = 0; i < (size_t)dim * work_seq; i++) {
             x[i] += ane_out[i];
         }
         total_res_ms += timer_ms(tr, timer_now());
@@ -384,8 +384,8 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
         uint64_t tk = timer_now();
         //    ANE K output: channels [dim .. dim+kv_dim-1], channels-first [kv_dim, seq]
         //    KV cache layout: [head][pos][dim] = cache[h * max_seq * head_dim + pos * head_dim + d]
-        _Float16 *k_out = ane_out + (size_t)dim * seq;      // [kv_dim, seq] channels-first
-        _Float16 *v_out = ane_out + (size_t)(dim + kv_dim) * seq; // [kv_dim, seq] channels-first
+        _Float16 *k_out = ane_out + (size_t)dim * work_seq;      // [kv_dim, work_seq]
+        _Float16 *v_out = ane_out + (size_t)(dim + kv_dim) * work_seq; // [kv_dim, work_seq]
         _Float16 *k_cache = (_Float16 *)((id<MTLBuffer>)(kv->k_cache[l])).contents;
         _Float16 *v_cache = (_Float16 *)((id<MTLBuffer>)(kv->v_cache[l])).contents;
 
@@ -394,8 +394,8 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
                 for (int d = 0; d < head_dim; d++) {
                     int ch = h * head_dim + d; // channel index in kv_dim
                     int cache_idx = h * kv->max_seq * head_dim + t * head_dim + d;
-                    k_cache[cache_idx] = k_out[(size_t)ch * seq + t];
-                    v_cache[cache_idx] = v_out[(size_t)ch * seq + t];
+                    k_cache[cache_idx] = k_out[(size_t)ch * work_seq + t];
+                    v_cache[cache_idx] = v_out[(size_t)ch * work_seq + t];
                 }
             }
         }
@@ -403,7 +403,7 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
 
         // d. GPU batched FFN: 1 command buffer per layer (MPS matmul)
         uint64_t tf = timer_now();
-        gpu_forward_ffn_batch(gpu, m, l, x, seq);
+        gpu_forward_ffn_batch(gpu, m, l, x, work_seq);
         total_ffn_ms += timer_ms(tf, timer_now());
     }
 
@@ -411,7 +411,7 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
     {
         _Float16 *gpu_x = gpu_get_buf_x(gpu);
         for (int d = 0; d < dim; d++) {
-            gpu_x[d] = x[(size_t)d * seq + (seq - 1)];
+            gpu_x[d] = x[(size_t)d * work_seq + (seq - 1)];
         }
         gpu_forward_classifier(gpu, m);
     }

@@ -168,9 +168,21 @@ interne Buffer-Alloc in libane.
 
 GPU FFN ist jetzt der Hauptflaschenhals — nicht mehr ANE I/O.
 
+### Cached MPS Objects [IMPLEMENTED]
+
+Per-Layer MPSMatrix Wrapper und MPSMatrixMultiplication Objekte einmal in
+`gpu_init_ffn_batch()` erstellen statt pro Aufruf (71 cached Objekte).
+
+**Impact:** Kein messbarer Speedup (~420 tok/s vor und nach).
+Ursache: ObjC Alloc/ARC war nicht der Bottleneck. Die eigentliche GPU
+Compute-Zeit (MPS Matmul auf [5632,2048]×[2048,128]) dominiert.
+
+**Wichtiger Fix:** Konsistente `work_seq` Dimension durch die gesamte Pipeline.
+Alle Buffers, ANE Kernels und MPS Objekte nutzen dieselbe Groesse (max(128, n_prompt)).
+Vorher: Mismatch zwischen ANE compiled_seq und MPS matrix columns → kaputte Outputs.
+
 ## Naechste Schritte (Potenzial)
 
-- **GPU FFN Overhead** — 53% der Zeit. MPS Objekt-Erstellung + memcpy pro Layer kostet ~3ms/L
+- **GPU FFN Compute** — 53% der Zeit, dominiert von MPS Matmul. Custom Metal Kernels mit fused dequant koennten schneller sein als MPS+FP16
 - **Groessere Modelle** (7B) mit mmap + Fiber-Loading testen
 - **ANE Decode** fuer laengere Kontexte (>256 tokens)
-- **Cached MPS Objects** — MPSMatrix/MPSMatrixMultiplication einmal erstellen statt pro Layer

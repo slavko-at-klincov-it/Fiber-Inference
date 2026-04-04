@@ -48,6 +48,12 @@ typedef struct {
     // Sizes in bytes
     size_t wq_size, wk_size, wv_size, wo_size;
     size_t w1_size, w2_size, w3_size;
+    // Dequantized FP16 attention weights (for ANE, allocated by model_dequant_attention)
+    _Float16 *wq_fp16;       // [dim, dim]
+    _Float16 *wk_fp16;       // [kv_dim, dim]
+    _Float16 *wv_fp16;       // [kv_dim, dim]
+    _Float16 *wo_fp16;       // [dim, dim]
+    _Float16 *attn_norm_fp16; // [dim]
 } layer_weights_t;
 
 // Model handle
@@ -61,6 +67,13 @@ typedef struct {
     ggml_type_t     token_embd_type;
     ggml_type_t     output_norm_type;
     ggml_type_t     output_type;
+    // Per-layer dequantized FP16 attention weights (for ANE, Phase 2)
+    _Float16      **attn_wq_fp16;     // [n_layers] array of pointers, each [dim * dim]
+    _Float16      **attn_wk_fp16;     // [n_layers], each [kv_dim * dim]
+    _Float16      **attn_wv_fp16;     // [n_layers], each [kv_dim * dim]
+    _Float16      **attn_wo_fp16;     // [n_layers], each [dim * dim]
+    _Float16      **attn_norm_fp16;   // [n_layers], each [dim]
+    bool            attn_fp16_ready;  // true after model_dequant_attention()
 } model_t;
 
 // Open model from GGUF file
@@ -77,6 +90,13 @@ void model_prefetch_layer(const model_t *m, uint32_t layer_idx);
 
 // Evict layer's pages from RAM (tell OS we're done)
 void model_evict_layer(const model_t *m, uint32_t layer_idx);
+
+// Dequantize attention weights (Q4_K/Q6_K → FP16) for ANE.
+// Returns total bytes allocated. Call model_free_attention_fp16 after ANE compile.
+size_t model_dequant_attention(model_t *m);
+
+// Free dequantized FP16 attention weights (after ANE has baked them)
+void model_free_attention_fp16(model_t *m);
 
 // Print model info summary
 void model_print_info(const model_t *m);

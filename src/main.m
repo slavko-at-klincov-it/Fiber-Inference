@@ -12,6 +12,7 @@
 #include "sampler.h"
 #include "kv_cache.h"
 #include "gpu_ffn.h"
+#include "ane_attn.h"
 #include "timer.h"
 
 #define MAX_PROMPT_TOKENS 4096
@@ -139,6 +140,41 @@ int main(int argc, char *argv[]) {
         if (!gpu) { fprintf(stderr, "Failed to init GPU\n"); tokenizer_free(tok); model_close(m); return 1; }
         printf("GPU initialized in %.1f ms\n", timer_ms(t0, t1));
 
+        // ======= Initialize ANE =======
+        t0 = timer_now();
+        ane_attn_context_t *ane_ctx = ane_attn_init();
+        t1 = timer_now();
+        if (ane_ctx) {
+            printf("ANE initialized in %.1f ms\n", timer_ms(t0, t1));
+
+            // Dequantize attention weights for ANE (Q4_K/Q6_K → FP16)
+            t0 = timer_now();
+            size_t dq_bytes = model_dequant_attention(m);
+            t1 = timer_now();
+            printf("Dequantized attention weights: %.1f MB in %.1f ms\n",
+                   dq_bytes / (1024.0 * 1024.0), timer_ms(t0, t1));
+
+            // Compile ANE attention kernels
+            t0 = timer_now();
+            bool ane_ok = ane_attn_compile(ane_ctx, m, 512);
+            t1 = timer_now();
+            if (ane_ok) {
+                printf("ANE kernels compiled in %.1f ms\n", timer_ms(t0, t1));
+                // Free dequantized weights (ANE baked them)
+                model_free_attention_fp16(m);
+                printf("Freed FP16 weights, RSS: %.1f MB\n",
+                       model_get_rss() / (1024.0 * 1024.0));
+                // Quick validation
+                ane_attn_validate(ane_ctx, m);
+            } else {
+                fprintf(stderr, "ANE kernel compilation failed, using GPU-only\n");
+                ane_attn_free(ane_ctx);
+                ane_ctx = NULL;
+            }
+        } else {
+            printf("ANE not available, using GPU-only mode\n");
+        }
+
         // ======= Initialize KV cache =======
         kv_cache_t *kv = kv_cache_init(gpu_get_device(gpu),
                                         m->params.n_layers,
@@ -176,9 +212,16 @@ int main(int argc, char *argv[]) {
 
         // ======= Prefill: process all prompt tokens =======
         t0 = timer_now();
-        for (int i = 0; i < n_prompt; i++) {
-            // gpu_forward_token includes classifier
-            forward_token(gpu, m, kv, prompt_tokens[i], i);
+        double prefill_tps = 0;
+        if (ane_ctx && n_prompt > 1) {
+            // ANE batched prefill: ANE attention + GPU FFN
+            prefill_tps = ane_prefill_batch(ane_ctx, gpu, m, kv,
+                                             prompt_tokens, n_prompt);
+        } else {
+            // GPU-only prefill (token by token)
+            for (int i = 0; i < n_prompt; i++) {
+                forward_token(gpu, m, kv, prompt_tokens[i], i);
+            }
         }
         t1 = timer_now();
         double prefill_ms = timer_ms(t0, t1);
@@ -221,6 +264,7 @@ int main(int argc, char *argv[]) {
         printf("Peak RSS: %.1f MB\n", model_get_rss() / (1024.0 * 1024.0));
 
         kv_cache_free(kv);
+        ane_attn_free(ane_ctx);
         gpu_free(gpu);
         tokenizer_free(tok);
         model_close(m);

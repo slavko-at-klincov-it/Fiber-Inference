@@ -76,56 +76,8 @@ static void enc_rms(id<MTLComputeCommandEncoder> e, id<MTLComputePipelineState> 
     [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
 }
 
-// CPU dequant for embedding (Q4_K)
-static void dequant_q4k_row_f16(const void *data, int row, _Float16 *out, int dim) {
-    int bpr = dim / 256;
-    const uint8_t *base = (const uint8_t *)data + (size_t)row * bpr * 144;
-    for (int b = 0; b < bpr; b++) {
-        const uint8_t *bl = base + b * 144;
-        _Float16 dh, dmh; memcpy(&dh, bl, 2); memcpy(&dmh, bl+2, 2);
-        float d = (float)dh, dm = (float)dmh;
-        const uint8_t *sc = bl+4, *qs = bl+16;
-        for (int j = 0; j < 4; j++) {
-            float s1,m1,s2,m2; int is = j*2;
-            if(is<4){s1=(float)(sc[is]&63);m1=(float)(sc[is+4]&63);}
-            else{s1=(float)((sc[is+4]&0xF)|((sc[is-4]>>6)<<4));m1=(float)((sc[is+4]>>4)|((sc[is]>>6)<<4));}
-            is=j*2+1;
-            if(is<4){s2=(float)(sc[is]&63);m2=(float)(sc[is+4]&63);}
-            else{s2=(float)((sc[is+4]&0xF)|((sc[is-4]>>6)<<4));m2=(float)((sc[is+4]>>4)|((sc[is]>>6)<<4));}
-            for(int l=0;l<32;l++){
-                uint8_t qv=qs[j*32+l];
-                out[b*256+j*64+l]    = (_Float16)(d*s1*(float)(qv&0xF)-dm*m1);
-                out[b*256+j*64+l+32] = (_Float16)(d*s2*(float)(qv>>4)-dm*m2);
-            }
-        }
-    }
-}
-
-static void dequant_q6k_row_f16(const void *data, int row, _Float16 *out, int dim) {
-    int bpr = dim / 256;
-    const uint8_t *base = (const uint8_t *)data + (size_t)row * bpr * 210;
-    for (int b = 0; b < bpr; b++) {
-        const uint8_t *bl = base + b * 210;
-        const uint8_t *ql = bl, *qh = bl+128;
-        const int8_t *sc = (const int8_t *)(bl+192);
-        _Float16 dh; memcpy(&dh, bl+208, 2); float d = (float)dh;
-        int bi = b * 256;
-        for (int n = 0; n < 256; n += 128) {
-            for (int l = 0; l < 32; l++) {
-                int is = l/16;
-                const int8_t q1 = (int8_t)((ql[l]&0xF)|(((qh[l]>>0)&3)<<4))-32;
-                const int8_t q2 = (int8_t)((ql[l+32]&0xF)|(((qh[l]>>2)&3)<<4))-32;
-                const int8_t q3 = (int8_t)((ql[l]>>4)|(((qh[l]>>4)&3)<<4))-32;
-                const int8_t q4 = (int8_t)((ql[l+32]>>4)|(((qh[l]>>6)&3)<<4))-32;
-                out[bi+n+l]    = (_Float16)(d*(float)sc[is+0]*(float)q1);
-                out[bi+n+l+32] = (_Float16)(d*(float)sc[is+2]*(float)q2);
-                out[bi+n+l+64] = (_Float16)(d*(float)sc[is+4]*(float)q3);
-                out[bi+n+l+96] = (_Float16)(d*(float)sc[is+6]*(float)q4);
-            }
-            ql += 64; qh += 32; sc += 8;
-        }
-    }
-}
+// CPU dequant — shared implementation in dequant.h
+#include "dequant.h"
 
 // ============================================================
 // Init
@@ -204,6 +156,79 @@ void gpu_free(gpu_context_t *c) { if (c) free(c); }
 id<MTLDevice> gpu_get_device(gpu_context_t *c) { return c->device; }
 const float *gpu_get_logits(gpu_context_t *c) { return (const float *)c->buf_logits.contents; }
 const float *gpu_get_hidden(gpu_context_t *c) { return NULL; } // buf_x is FP16 now
+_Float16 *gpu_get_buf_x(gpu_context_t *c) { return (_Float16 *)c->buf_x.contents; }
+
+// FFN-only for one layer (own command buffer, synchronous)
+void gpu_forward_ffn_layer(gpu_context_t *c, const model_t *m, uint32_t layer_idx) {
+    @autoreleasepool {
+        model_params_t p = c->params;
+        int dim = p.dim, ffn = p.ffn_dim;
+        float eps = p.rms_norm_eps;
+
+        layer_weights_t lw;
+        model_layer_weights(m, layer_idx, &lw);
+
+        id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        // RMSNorm(x) → xnorm
+        enc_rms(enc, c->pipe_rmsnorm, c->buf_x, c->buf_model, woff(c, lw.ffn_norm),
+                c->buf_xnorm, dim, eps);
+        // W1 matmul
+        enc_mv(enc, pipe_for_type(c, lw.w1_type), c->buf_model, woff(c, lw.w1),
+               c->buf_xnorm, c->buf_h1, dim, ffn);
+        // W3 matmul
+        enc_mv(enc, pipe_for_type(c, lw.w3_type), c->buf_model, woff(c, lw.w3),
+               c->buf_xnorm, c->buf_h3, dim, ffn);
+        // SiLU gate
+        [enc setComputePipelineState:c->pipe_silu];
+        [enc setBuffer:c->buf_h1 offset:0 atIndex:0];
+        [enc setBuffer:c->buf_h3 offset:0 atIndex:1];
+        [enc setBuffer:c->buf_silu offset:0 atIndex:2];
+        [enc setBytes:&ffn length:4 atIndex:3];
+        [enc dispatchThreads:MTLSizeMake(ffn,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        // W2 matmul
+        enc_mv(enc, pipe_for_type(c, lw.w2_type), c->buf_model, woff(c, lw.w2),
+               c->buf_silu, c->buf_proj, ffn, dim);
+        // Residual add: x += ffn_out
+        [enc setComputePipelineState:c->pipe_residual];
+        [enc setBuffer:c->buf_x offset:0 atIndex:0];
+        [enc setBuffer:c->buf_proj offset:0 atIndex:1];
+        [enc setBytes:&dim length:4 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+}
+
+// Classifier-only: final RMSNorm + output matmul → logits
+void gpu_forward_classifier(gpu_context_t *c, const model_t *m) {
+    @autoreleasepool {
+        model_params_t p = c->params;
+        int dim = p.dim, vocab = p.vocab_size;
+        float eps = p.rms_norm_eps;
+
+        id<MTLCommandBuffer> cb = [c->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+        enc_rms(enc, c->pipe_rmsnorm, c->buf_x, c->buf_model, woff(c, m->output_norm),
+                c->buf_xnorm, dim, eps);
+        [enc setComputePipelineState:pipe_for_type_f32(c, m->output_type)];
+        [enc setBuffer:c->buf_model offset:woff(c, m->output) atIndex:0];
+        [enc setBuffer:c->buf_xnorm offset:0 atIndex:1];
+        [enc setBuffer:c->buf_logits offset:0 atIndex:2];
+        [enc setBytes:&dim length:4 atIndex:3];
+        [enc setBytes:&vocab length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(vocab,1,1)
+            threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+}
 
 // ============================================================
 // Embedding (CPU → FP16 buf_x)

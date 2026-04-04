@@ -153,6 +153,95 @@ static float *cpu_forward_token(float *x, int pos, fiber_model_t *fm,
     return logits;
 }
 
+// Hybrid decode: CPU attention + ANE FFN
+// Same as cpu_forward_token but FFN runs on ANE
+static float *hybrid_forward_token(float *x, int pos, fiber_model_t *fm,
+                                    int n_layers, int dim, int heads, int kv_heads,
+                                    int hd, int ffn_dim, int vocab,
+                                    float **k_cache, float **v_cache, int max_seq,
+                                    ANEKernel **ffn_kernels, int ane_ffn_seq) {
+    float eps = FIBER_RMS_EPS;
+    float *xnorm = malloc(dim * sizeof(float));
+    float *q = malloc(dim * sizeof(float));
+    float *k = malloc(dim * sizeof(float));
+    float *v = malloc(dim * sizeof(float));
+    int kv_dim = kv_heads * hd;
+    size_t ane_in_bytes = (size_t)dim * ane_ffn_seq * sizeof(_Float16);
+
+    for (int l = 0; l < n_layers; l++) {
+        // === CPU ATTENTION (same as cpu_forward_token) ===
+        cpu_rmsnorm(xnorm, x, fm->attn_norm_f32[l], dim, eps);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, dim, dim, 1.0f,
+                    fm->wq_f32[l], dim, xnorm, 1, 0.0f, q, 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, kv_dim, dim, 1.0f,
+                    fm->wk_f32[l], dim, xnorm, 1, 0.0f, k, 1);
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, kv_dim, dim, 1.0f,
+                    fm->wv_f32[l], dim, xnorm, 1, 0.0f, v, 1);
+        cpu_rope(q, k, heads, kv_heads, hd, pos, FIBER_ROPE_BASE);
+        memcpy(k_cache[l] + (size_t)pos * kv_dim, k, kv_dim * sizeof(float));
+        memcpy(v_cache[l] + (size_t)pos * kv_dim, v, kv_dim * sizeof(float));
+
+        float *attn_out = calloc(dim, sizeof(float));
+        float scale = 1.0f / sqrtf((float)hd);
+        for (int h = 0; h < heads; h++) {
+            int kvh = h * kv_heads / heads;
+            float *scores = malloc((pos+1) * sizeof(float));
+            for (int t = 0; t <= pos; t++) {
+                float dot = 0;
+                for (int d = 0; d < hd; d++)
+                    dot += q[h*hd+d] * k_cache[l][t*kv_dim + kvh*hd + d];
+                scores[t] = dot * scale;
+            }
+            float maxs = scores[0];
+            for (int t = 1; t <= pos; t++) if (scores[t] > maxs) maxs = scores[t];
+            float sum = 0;
+            for (int t = 0; t <= pos; t++) { scores[t] = expf(scores[t]-maxs); sum += scores[t]; }
+            for (int t = 0; t <= pos; t++) scores[t] /= sum;
+            for (int t = 0; t <= pos; t++)
+                for (int d = 0; d < hd; d++)
+                    attn_out[h*hd+d] += scores[t] * v_cache[l][t*kv_dim + kvh*hd + d];
+            free(scores);
+        }
+        float *proj = malloc(dim * sizeof(float));
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, dim, dim, 1.0f,
+                    fm->wo_f32[l], dim, attn_out, 1, 0.0f, proj, 1);
+        for (int d = 0; d < dim; d++) x[d] += proj[d];
+        free(attn_out); free(proj);
+
+        // === ANE FFN (replaces CPU FFN) ===
+        // Pack x into channels-first FP16 [dim, ane_ffn_seq] (padded, token at pos 0)
+        _Float16 *ffn_in = calloc(dim * ane_ffn_seq, sizeof(_Float16));
+        for (int d = 0; d < dim; d++) ffn_in[(size_t)d * ane_ffn_seq] = (_Float16)x[d];
+
+        ane_lock_input(ffn_kernels[l], 0);
+        memcpy(ane_input_ptr(ffn_kernels[l], 0), ffn_in, ane_in_bytes);
+        ane_unlock_input(ffn_kernels[l], 0);
+        ane_eval(ffn_kernels[l], ANE_QOS_BACKGROUND);
+        ane_lock_output(ffn_kernels[l], 0);
+        _Float16 *ffn_out_ptr = (_Float16 *)ane_output_ptr(ffn_kernels[l], 0);
+        // Read back token at position 0 (FFN includes residual: out = x + ffn(x))
+        for (int d = 0; d < dim; d++) x[d] = (float)ffn_out_ptr[(size_t)d * ane_ffn_seq];
+        ane_unlock_output(ffn_kernels[l], 0);
+        free(ffn_in);
+    }
+
+    // Classifier (same as CPU)
+    float *final_norm = malloc(dim * sizeof(float));
+    float *norm_w = malloc(dim * sizeof(float));
+    for (int d = 0; d < dim; d++) norm_w[d] = (float)fm->output_norm[d];
+    cpu_rmsnorm(final_norm, x, norm_w, dim, eps);
+    free(norm_w);
+    float *logits = malloc(vocab * sizeof(float));
+    for (int vv = 0; vv < vocab; vv++) {
+        float dot = 0;
+        for (int d = 0; d < dim; d++)
+            dot += (float)fm->output[(size_t)vv*dim+d] * final_norm[d];
+        logits[vv] = dot;
+    }
+    free(final_norm); free(xnorm); free(q); free(k); free(v);
+    return logits;
+}
+
 static int argmax(const float *arr, int n) {
     int best = 0;
     for (int i = 1; i < n; i++) if (arr[i] > arr[best]) best = i;
@@ -437,27 +526,100 @@ void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *promp
     printf("\n\n");
 
     // ========================================
-    // Comparison
+    // Pipeline C: Hybrid Decode (CPU Attention + ANE FFN)
+    // ========================================
+    printf("--- Pipeline C: Hybrid Decode (CPU Attn + ANE FFN) ---\n");
+
+    // Compile FFN kernels for decode (seq=128 padded)
+    int decode_ffn_seq = 128;
+    ANEKernel *decode_ffn[12];
+    NSString *dfmil = gen_ffn_only_mil(dim, ffn_dim, decode_ffn_seq, FIBER_RMS_EPS);
+    size_t dfin = (size_t)dim * decode_ffn_seq * sizeof(_Float16);
+    for (int l = 0; l < n_layers; l++) {
+        ANEWeight dfw[4];
+        dfw[0]=ane_weight_fp16("@model_path/weights/ffn_norm.bin",fm->ffn_norm_f32[l],1,dim);
+        dfw[1]=ane_weight_fp16("@model_path/weights/w1.bin",fm->w1_f32[l],ffn_dim,dim);
+        dfw[2]=ane_weight_fp16("@model_path/weights/w3.bin",fm->w3_f32[l],ffn_dim,dim);
+        dfw[3]=ane_weight_fp16("@model_path/weights/w2.bin",fm->w2_f32[l],dim,ffn_dim);
+        decode_ffn[l] = ane_compile([dfmil UTF8String],strlen([dfmil UTF8String]),
+                                     dfw,4,1,&dfin,1,&dfin,ANE_QOS_BACKGROUND);
+        for(int w=0;w<4;w++) ane_weight_free(&dfw[w]);
+    }
+    printf("Compiled %d ANE FFN decode kernels (seq=%d)\n", n_layers, decode_ffn_seq);
+
+    // KV cache for hybrid decode
+    float **kc_c = calloc(n_layers, sizeof(float*));
+    float **vc_c = calloc(n_layers, sizeof(float*));
+    for (int l = 0; l < n_layers; l++) {
+        kc_c[l] = calloc((size_t)max_seq * kv_heads * hd, sizeof(float));
+        vc_c[l] = calloc((size_t)max_seq * kv_heads * hd, sizeof(float));
+    }
+
+    float *x_c = malloc(dim * sizeof(float));
+    int output_c[256];
+    int n_out_c = 0;
+
+    // Prefill on CPU (to fill KV cache)
+    for (int i = 0; i < n_prompt; i++) {
+        for (int d = 0; d < dim; d++)
+            x_c[d] = (float)fm->embedding[(size_t)tokens[i] * dim + d];
+        float *logits = cpu_forward_token(x_c, i, fm, n_layers, dim, heads, kv_heads,
+                                           hd, ffn_dim, vocab, kc_c, vc_c, max_seq);
+        if (i == n_prompt - 1) output_c[n_out_c++] = argmax(logits, vocab);
+        free(logits);
+    }
+
+    // Hybrid decode: CPU attention + ANE FFN
+    uint64_t td_c = timer_now();
+    for (int step = 0; step < gen_tokens - 1 && n_prompt + n_out_c < max_seq; step++) {
+        int tok_id = output_c[n_out_c - 1];
+        if (tok_id == 2) break; // EOS
+        for (int d = 0; d < dim; d++)
+            x_c[d] = (float)fm->embedding[(size_t)tok_id * dim + d];
+        float *logits = hybrid_forward_token(x_c, n_prompt + n_out_c - 1, fm,
+                                              n_layers, dim, heads, kv_heads,
+                                              hd, ffn_dim, vocab, kc_c, vc_c, max_seq,
+                                              decode_ffn, decode_ffn_seq);
+        output_c[n_out_c++] = argmax(logits, vocab);
+        free(logits);
+    }
+    double decode_c_ms = timer_ms(td_c, timer_now());
+
+    printf("Decode:  %d tokens in %.1f ms (%.1f tok/s)\n",
+           n_out_c, decode_c_ms, n_out_c / (decode_c_ms/1000.0));
+    printf("Output: ");
+    for (int i = 0; i < n_prompt; i++) printf("%s", tokenizer_decode(tok, tokens[i]));
+    for (int i = 0; i < n_out_c; i++) printf("%s", tokenizer_decode(tok, output_c[i]));
+    printf("\n\n");
+
+    // Match check
+    int match_c = 0;
+    int min_c = n_out_a < n_out_c ? n_out_a : n_out_c;
+    for (int i = 0; i < min_c; i++) if (output_a[i] == output_c[i]) match_c++;
+
+    for (int l = 0; l < n_layers; l++) { free(kc_c[l]); free(vc_c[l]); if(decode_ffn[l]) ane_free(decode_ffn[l]); }
+    free(kc_c); free(vc_c); free(x_c);
+
+    // ========================================
+    // Comparison (3-way)
     // ========================================
     printf("========================================\n");
-    printf("  COMPARISON\n");
+    printf("  COMPARISON (3 Pipelines)\n");
     printf("========================================\n");
-    printf("              CPU/AMX          ANE\n");
-    printf("Prefill:  %6.1f ms (%5.1f t/s)  %6.1f ms (%5.1f t/s)  %.1fx\n",
-           prefill_a_ms, n_prompt/(prefill_a_ms/1000.0),
-           prefill_b_ms, n_prompt/(prefill_b_ms/1000.0),
-           prefill_a_ms / prefill_b_ms);
-    printf("Decode:   %6.1f ms (%5.1f t/s)  %6.1f ms (%5.1f t/s)  %.1fx\n",
-           decode_a_ms, n_out_a/(decode_a_ms/1000.0),
-           decode_b_ms, n_out_b/(decode_b_ms/1000.0),
-           decode_a_ms / decode_b_ms);
-    printf("\nFirst token match: %s (CPU=[%d] ANE=[%d])\n",
-           output_a[0] == output_b[0] ? "YES" : "NO", output_a[0], output_b[0]);
-    printf("Full output match: ");
-    int match_count = 0;
-    int min_out = n_out_a < n_out_b ? n_out_a : n_out_b;
-    for (int i = 0; i < min_out; i++) if (output_a[i] == output_b[i]) match_count++;
-    printf("%d/%d tokens match\n", match_count, min_out);
+    printf("                CPU/AMX     ANE-RePrefill  Hybrid(CPU+ANE)\n");
+    printf("Prefill:    %5.1f t/s      %5.1f t/s       (CPU prefill)\n",
+           n_prompt/(prefill_a_ms/1000.0), n_prompt/(prefill_b_ms/1000.0));
+    printf("Decode:     %5.1f t/s      %5.1f t/s       %5.1f t/s\n",
+           n_out_a/(decode_a_ms/1000.0),
+           n_out_b/(decode_b_ms/1000.0),
+           n_out_c/(decode_c_ms/1000.0));
+    printf("Speedup:      1.0x          %.1fx             %.1fx\n",
+           decode_a_ms / decode_b_ms, decode_a_ms / decode_c_ms);
+    int match_b = 0;
+    int min_b = n_out_a < n_out_b ? n_out_a : n_out_b;
+    for (int i = 0; i < min_b; i++) if (output_a[i] == output_b[i]) match_b++;
+    printf("\nToken match vs CPU: RePrefill=%d/%d, Hybrid=%d/%d\n",
+           match_b, min_b, match_c, min_c);
     printf("========================================\n");
 
     // Cleanup

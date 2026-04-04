@@ -35,13 +35,27 @@ Bei kurzen Kontexten (≤32 Tokens) dominiert der Overhead.
 4. **Kein FP16 Precision-Drift** — nach 32 Re-Prefills mit akkumulierten Residuals
    sind alle Tokens noch identisch mit der FP32 CPU Baseline
 
-## Naechster Schritt: Echtes inkrementelles Decode
+## Pipeline C: Hybrid Decode (CPU Attn + ANE FFN) [MEASURED]
 
-Fuer Speed-Verbesserung braucht es:
-- KV Cache als ANE **Input** (nicht Re-Prefill)
-- 3-Input MIL Kernel: x[dim,1] + k_cache[kv_dim,ctx] + v_cache[kv_dim,ctx]
-- `ane_compile()` mit n_inputs=3 (unterstuetzt laut libane/ane.h)
-- Erwartung: ~200-400 tok/s Decode (5-6x ueber CPU Baseline)
+| Pipeline | Decode tok/s | Token Match |
+|----------|-------------|-------------|
+| CPU/AMX (Baseline) | 68.6 | 32/32 |
+| ANE Re-Prefill | 64.5 (0.9x) | 32/32 |
+| **Hybrid (CPU Attn + ANE FFN)** | **65.7 (1.0x)** | **32/32** |
+
+Hybrid ist ~gleich schnell wie CPU. Der ANE FFN Dispatch-Overhead
+(IOSurface lock + memcpy + eval + memcpy fuer padded seq=128) frisst
+den Compute-Vorteil bei nur 1 Token.
+
+**Analyse:** Fuer Single-Token Decode ist ANE nur dann schneller wenn
+BEIDE Ops (Attention + FFN) auf ANE laufen — dann entfaellt der
+CPU↔ANE Transfer pro Layer (12 × 2 Transfers = 24 IOSurface Roundtrips).
+
+## Naechster Schritt: Voll-ANE Decode Kernel
+
+Braucht: Packed-Input MIL mit Q + KV Cache in einem IOSurface.
+Alle bestehenden Beispiele nutzen 1 IOSurface mit Slicing.
+Erwartet: Wenn Transfer-Overhead eliminiert wird, ~2-3x Decode Speedup.
 
 ## Fixes in diesem Commit
 

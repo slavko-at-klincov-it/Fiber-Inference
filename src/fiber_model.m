@@ -42,18 +42,27 @@ fiber_model_t *fiber_model_create(void) {
         fm->attn_norm[l] = ones_fp16(dim);        total += dim * 2;
         fm->ffn_norm[l]  = ones_fp16(dim);        total += dim * 2;
 
-        // Pre-convert FFN weights to FP32 for AMX (eliminates per-layer conversion)
-        int ffn_x_dim = ffn * dim;
-        int dim_x_ffn = dim * ffn;
-        fm->w1_f32[l] = malloc(ffn_x_dim * sizeof(float));
-        fm->w3_f32[l] = malloc(ffn_x_dim * sizeof(float));
-        fm->w2_f32[l] = malloc(dim_x_ffn * sizeof(float));
+        // FP32 versions of ALL weights (for ane_weight_fp16 and cblas)
+        int dd = dim * dim, kd = kv_dim * dim, fd = ffn * dim, df = dim * ffn;
+        fm->wq_f32[l] = malloc(dd * sizeof(float));
+        fm->wk_f32[l] = malloc(kd * sizeof(float));
+        fm->wv_f32[l] = malloc(kd * sizeof(float));
+        fm->wo_f32[l] = malloc(dd * sizeof(float));
+        fm->w1_f32[l] = malloc(fd * sizeof(float));
+        fm->w3_f32[l] = malloc(fd * sizeof(float));
+        fm->w2_f32[l] = malloc(df * sizeof(float));
+        fm->attn_norm_f32[l] = malloc(dim * sizeof(float));
         fm->ffn_norm_f32[l] = malloc(dim * sizeof(float));
-        for (int i = 0; i < ffn_x_dim; i++) fm->w1_f32[l][i] = (float)fm->w1[l][i];
-        for (int i = 0; i < ffn_x_dim; i++) fm->w3_f32[l][i] = (float)fm->w3[l][i];
-        for (int i = 0; i < dim_x_ffn; i++) fm->w2_f32[l][i] = (float)fm->w2[l][i];
+        for (int i = 0; i < dd; i++) fm->wq_f32[l][i] = (float)fm->wq[l][i];
+        for (int i = 0; i < kd; i++) fm->wk_f32[l][i] = (float)fm->wk[l][i];
+        for (int i = 0; i < kd; i++) fm->wv_f32[l][i] = (float)fm->wv[l][i];
+        for (int i = 0; i < dd; i++) fm->wo_f32[l][i] = (float)fm->wo[l][i];
+        for (int i = 0; i < fd; i++) fm->w1_f32[l][i] = (float)fm->w1[l][i];
+        for (int i = 0; i < fd; i++) fm->w3_f32[l][i] = (float)fm->w3[l][i];
+        for (int i = 0; i < df; i++) fm->w2_f32[l][i] = (float)fm->w2[l][i];
+        for (int i = 0; i < dim; i++) fm->attn_norm_f32[l][i] = 1.0f;
         for (int i = 0; i < dim; i++) fm->ffn_norm_f32[l][i] = 1.0f;
-        total += (ffn_x_dim * 2 + dim_x_ffn) * sizeof(float) + dim * sizeof(float);
+        total += (dd*2 + kd*2 + fd*2 + df + dim*2) * sizeof(float);
     }
 
     fm->embedding   = rand_fp16(vocab, dim);      total += vocab * dim * 2;
@@ -72,8 +81,9 @@ void fiber_model_free(fiber_model_t *fm) {
         free(fm->wq[l]); free(fm->wk[l]); free(fm->wv[l]); free(fm->wo[l]);
         free(fm->w1[l]); free(fm->w3[l]); free(fm->w2[l]);
         free(fm->attn_norm[l]); free(fm->ffn_norm[l]);
+        free(fm->wq_f32[l]); free(fm->wk_f32[l]); free(fm->wv_f32[l]); free(fm->wo_f32[l]);
         free(fm->w1_f32[l]); free(fm->w3_f32[l]); free(fm->w2_f32[l]);
-        free(fm->ffn_norm_f32[l]);
+        free(fm->attn_norm_f32[l]); free(fm->ffn_norm_f32[l]);
     }
     free(fm->embedding); free(fm->output_norm); free(fm->output);
     free(fm);

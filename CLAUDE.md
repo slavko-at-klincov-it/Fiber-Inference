@@ -8,10 +8,9 @@ um groessere Modelle und laengere Kontexte zu ermoeglichen als jedes existierend
 
 ## Status
 
-Phase 2 fertig + Fiber-768 Architektur-Prototyp.
-- **1962 tok/s Prefill** mit Fiber-768 (ANE Attention + AMX FFN) [MEASURED]
-- **420 tok/s Prefill** auf TinyLlama-1.1B (ANE+GPU) [MEASURED]
-- 49x Boost gegenueber GPU-only Baseline (40 tok/s)
+Fiber-768 Architektur: ANE-native LLM Inference.
+- **10,241 tok/s Prefill** mit ANE Attention + ANE FFN [MEASURED]
+- 256x Boost gegenueber GPU-only Baseline (40 tok/s)
 - Eigene Architektur: dim=768, 12 heads, 4x FFN, 24 Layers (~800M params)
 - Details: `docs/fiber768-findings.md`, `docs/phase2-findings.md`
 

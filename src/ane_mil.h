@@ -167,4 +167,53 @@ static NSString *gen_sdpa_prefill_mil(int dim, int n_heads, int n_kv_heads,
     return m;
 }
 
+// Generate pure FFN kernel for ANE (no attention, just SwiGLU FFN)
+// Input:  [1, dim, 1, seq] FP16
+// Output: [1, dim, 1, seq] FP16 (FFN output, before residual)
+// Weights baked: W1 [ffn,dim], W3 [ffn,dim], W2 [dim,ffn], ffn_norm [dim]
+// Based on gdc-lm/src/mil_gen.h gen_gdc_fused_ffn pattern (9 nodes/layer)
+static NSString *gen_ffn_only_mil(int dim, int ffn_dim, int seq, float rms_eps) {
+    float invd = 1.0f / (float)dim;
+    NSMutableString *m = [NSMutableString string];
+    [m appendString:MIL_HDR];
+    [m appendFormat:@"    func main<ios18>(tensor<fp16, [1, %d, 1, %d]> x) {\n", dim, seq];
+
+    // RMSNorm (8 nodes)
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sq = mul(x=x,y=x)[name=string(\"sq\")];\n", dim, seq];
+    [m appendString:@"        tensor<int32, [1]> rax = const()[name=string(\"rax\"), val=tensor<int32, [1]>([1])];\n"];
+    [m appendString:@"        bool kd = const()[name=string(\"kd\"), val=bool(true)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss = reduce_sum(x=sq,axes=rax,keep_dims=kd)[name=string(\"ss\")];\n", seq];
+    [m appendFormat:@"        fp16 invd = const()[name=string(\"invd\"), val=fp16(%f)];\n", invd];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];\n", seq];
+    [m appendFormat:@"        fp16 eps = const()[name=string(\"eps\"), val=fp16(%e)];\n", rms_eps];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];\n", seq];
+    [m appendString:@"        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];\n"];
+    [m appendFormat:@"        tensor<fp16, [1,1,1,%d]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];\n", seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];\n", dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/ffn_norm.bin\"), offset=uint64(64)))];\n", dim, dim];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];\n", dim, seq];
+
+    // Conv constants
+    [m appendString:@"        string pt = const()[name=string(\"pt\"), val=string(\"valid\")];\n"];
+    [m appendString:@"        tensor<int32, [2]> st = const()[name=string(\"st\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        tensor<int32, [4]> pd = const()[name=string(\"pd\"), val=tensor<int32, [4]>([0,0,0,0])];\n"];
+    [m appendString:@"        tensor<int32, [2]> dl = const()[name=string(\"dl\"), val=tensor<int32, [2]>([1,1])];\n"];
+    [m appendString:@"        int32 gr = const()[name=string(\"gr\"), val=int32(1)];\n"];
+
+    // SwiGLU FFN (9 nodes: 3 conv + sigmoid + 2 mul)
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W1 = const()[name=string(\"W1\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w1.bin\"), offset=uint64(64)))];\n", ffn_dim, dim, ffn_dim, dim];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W3 = const()[name=string(\"W3\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w3.bin\"), offset=uint64(64)))];\n", ffn_dim, dim, ffn_dim, dim];
+    [m appendFormat:@"        tensor<fp16, [%d,%d,1,1]> W2 = const()[name=string(\"W2\"), val=tensor<fp16, [%d,%d,1,1]>(BLOBFILE(path=string(\"@model_path/weights/w2.bin\"), offset=uint64(64)))];\n", dim, ffn_dim, dim, ffn_dim];
+
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h1 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W1,x=xn)[name=string(\"c1\")];\n", ffn_dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> h3 = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W3,x=xn)[name=string(\"c3\")];\n", ffn_dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> sg = sigmoid(x=h1)[name=string(\"sg\")];\n", ffn_dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> si = mul(x=h1,y=sg)[name=string(\"si\")];\n", ffn_dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> gt = mul(x=si,y=h3)[name=string(\"gt\")];\n", ffn_dim, seq];
+    [m appendFormat:@"        tensor<fp16, [1,%d,1,%d]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W2,x=gt)[name=string(\"c2\")];\n", dim, seq];
+
+    [m appendString:@"    } -> (out);\n}\n"];
+    return m;
+}
+
 // end of ane_mil.h

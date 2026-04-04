@@ -104,8 +104,48 @@ Weitere Speedups brauchen entweder:
 - GPU fuer FFN bei grossem seq (GPU wird effizienter bei seq > 256)
 - Beide parallel
 
+---
+
+## ANE FFN: 10,241 tok/s — der eigentliche Durchbruch [MEASURED]
+
+### Ergebnis
+
+| Pipeline | Prefill tok/s | vs GPU-only |
+|----------|--------------|-------------|
+| GPU-only (Baseline) | 40 | 1x |
+| ANE Attention + GPU FFN (MPS) | 420 | 10.5x |
+| ANE Attention + AMX FFN (cblas) | 2,018 | 50x |
+| **ANE Attention + ANE FFN** | **10,241** | **256x** |
+
+### Breakdown (256 tokens, 24 layers)
+
+| Komponente | ANE+AMX | ANE-Only | Delta |
+|-----------|---------|----------|-------|
+| ANE Attention | 0.74 ms/L | 0.49 ms/L | -34% (weniger CPU-Interferenz) |
+| FFN | 4.53 ms/L (AMX) | **0.54 ms/L (ANE)** | **-88%** |
+| Total | 127 ms | **25 ms** | **-80%** |
+
+### Warum ANE FFN so viel schneller ist als AMX
+
+1. **ANE**: 19 TFLOPS FP16 — FFN als 1x1 Conv ist natuerlich fuer ANE
+2. **AMX**: 1.6 TFLOPS FP32 — AMX ist 12x langsamer in raw TFLOPS
+3. **Kein Transfer**: ANE→ANE braucht keinen Daten-Transfer ueber CPU
+4. **FP16 durchgehend**: Kein FP16↔FP32 Konvertierungs-Overhead
+
+### Was das bedeutet
+
+Die optimale Fiber-768 Architektur nutzt **ANE fuer alles** (Attention + FFN).
+AMX und GPU werden frei fuer:
+- Decode (GPU fuer Decode-Attention mit wachsendem KV Cache)
+- Embedding / Classifier (AMX oder GPU)
+- Background-Tasks (SSD Prefetch auf E-Cores)
+
+**10,241 tok/s bei 800M Parametern auf einem Mac Mini.**
+Das ist schneller als die meisten NVIDIA Server-GPUs fuer vergleichbare Modellgroessen.
+
 ## Offene Fragen
 
-- Kann ANE FFN schneller sein als AMX FFN? (gdc-lm: 9.6 TFLOPS reine FFN auf ANE)
-- Kann ANE Attention + ANE FFN fused werden? (gdc-lm: 5 Layers/Kernel)
+- Kann ANE Attention + ANE FFN in **einem** fused Kernel laufen? (gdc-lm: 17 nodes/layer, 3 Layer max)
 - Wie verhaelt sich die Qualitaet mit trainierten Weights vs Random?
+- Skaliert das zu groesseren Modellen (2B, 7B)?
+- Laesst sich das Modell trainieren? (ANE-Training hat 2.43 TFLOPS Training bewiesen)

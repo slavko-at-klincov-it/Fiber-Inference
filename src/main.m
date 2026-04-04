@@ -106,15 +106,15 @@ static void run_fiber768_bench(void) {
         // Build weight blobs from synthetic FP16 weights
         ANEWeight weights[8];
         weights[0] = ane_weight_fp16("@model_path/weights/rms1.bin",
-                                      (const float *)fm->attn_norm[l], 1, dim);
+                                      fm->attn_norm_f32[l], 1, dim);
         weights[1] = ane_weight_fp16("@model_path/weights/wq.bin",
-                                      (const float *)fm->wq[l], dim, dim);
+                                      fm->wq_f32[l], dim, dim);
         weights[2] = ane_weight_fp16("@model_path/weights/wk.bin",
-                                      (const float *)fm->wk[l], kv_dim, dim);
+                                      fm->wk_f32[l], kv_dim, dim);
         weights[3] = ane_weight_fp16("@model_path/weights/wv.bin",
-                                      (const float *)fm->wv[l], kv_dim, dim);
+                                      fm->wv_f32[l], kv_dim, dim);
         weights[4] = ane_weight_fp16("@model_path/weights/wo.bin",
-                                      (const float *)fm->wo[l], dim, dim);
+                                      fm->wo_f32[l], dim, dim);
 
         // cos/sin tables
         int hd2 = FIBER_HEAD_DIM / 2;
@@ -204,6 +204,97 @@ static void run_fiber768_bench(void) {
     printf("  Other:         %6.1f ms\n", total_ms - ane_total - amx_total);
     printf("  Total:         %6.1f ms (%.1f tok/s)\n", total_ms, tok_per_s);
     printf("===============================================\n");
+
+    // ================================================================
+    // Benchmark B: ANE Attention + ANE FFN (everything on ANE)
+    // ================================================================
+    printf("\n--- Benchmark B: ANE Attention + ANE FFN ---\n");
+    printf("Compiling ANE FFN kernels...\n");
+
+    NSString *ffn_mil = gen_ffn_only_mil(dim, FIBER_FFN_DIM, seq, FIBER_RMS_EPS);
+    const char *ffn_mil_c = [ffn_mil UTF8String];
+    size_t ffn_mil_len = strlen(ffn_mil_c);
+    size_t ffn_out_bytes = (size_t)dim * seq * sizeof(_Float16);
+
+    ANEKernel *ffn_kernels[FIBER_LAYERS];
+    int ffn_compiled = 0;
+    t0 = timer_now();
+    for (int l = 0; l < FIBER_LAYERS; l++) {
+        ANEWeight fw[4];
+        // Use FP32 versions for ane_weight_fp16 (which expects float* and converts)
+        fw[0] = ane_weight_fp16("@model_path/weights/ffn_norm.bin",
+                                 fm->ffn_norm_f32[l], 1, dim);
+        fw[1] = ane_weight_fp16("@model_path/weights/w1.bin",
+                                 fm->w1_f32[l], FIBER_FFN_DIM, dim);
+        fw[2] = ane_weight_fp16("@model_path/weights/w3.bin",
+                                 fm->w3_f32[l], FIBER_FFN_DIM, dim);
+        fw[3] = ane_weight_fp16("@model_path/weights/w2.bin",
+                                 fm->w2_f32[l], dim, FIBER_FFN_DIM);
+
+        ffn_kernels[l] = ane_compile(ffn_mil_c, ffn_mil_len, fw, 4,
+                                      1, &in_bytes, 1, &ffn_out_bytes, ANE_QOS_BACKGROUND);
+        if (ffn_kernels[l]) ffn_compiled++;
+        for (int w = 0; w < 4; w++) ane_weight_free(&fw[w]);
+    }
+    printf("ANE FFN: compiled %d/%d in %.1f ms (budget: %d/119)\n",
+           ffn_compiled, FIBER_LAYERS, timer_ms(t0, timer_now()), ane_compile_count());
+
+    if (ffn_compiled == FIBER_LAYERS) {
+        // Reset x to embeddings
+        for (int t = 0; t < seq; t++)
+            for (int d = 0; d < dim; d++)
+                x[(size_t)d * seq + t] = fm->embedding[(size_t)(t % FIBER_VOCAB) * dim + d];
+
+        // Warmup
+        ane_write(ffn_kernels[0], 0, x, in_bytes);
+        ane_eval(ffn_kernels[0], ANE_QOS_BACKGROUND);
+
+        double ane_attn2 = 0, ane_ffn2 = 0;
+        t0 = timer_now();
+
+        for (int l = 0; l < FIBER_LAYERS; l++) {
+            // ANE Attention
+            uint64_t ta = timer_now();
+            ane_lock_input(kernels[l], 0);
+            memcpy(ane_input_ptr(kernels[l], 0), x, in_bytes);
+            ane_unlock_input(kernels[l], 0);
+            ane_eval(kernels[l], ANE_QOS_BACKGROUND);
+            ane_lock_output(kernels[l], 0);
+            memcpy(ane_out, ane_output_ptr(kernels[l], 0), out_bytes_ane);
+            ane_unlock_output(kernels[l], 0);
+            ane_attn2 += timer_ms(ta, timer_now());
+
+            // Residual (attn output is first dim channels)
+            for (size_t i = 0; i < (size_t)dim * seq; i++)
+                x[i] += ane_out[i];
+
+            // ANE FFN
+            uint64_t tf = timer_now();
+            _Float16 *ffn_result = calloc(dim * seq, sizeof(_Float16));
+            ane_lock_input(ffn_kernels[l], 0);
+            memcpy(ane_input_ptr(ffn_kernels[l], 0), x, in_bytes);
+            ane_unlock_input(ffn_kernels[l], 0);
+            ane_eval(ffn_kernels[l], ANE_QOS_BACKGROUND);
+            ane_lock_output(ffn_kernels[l], 0);
+            memcpy(ffn_result, ane_output_ptr(ffn_kernels[l], 0), ffn_out_bytes);
+            ane_unlock_output(ffn_kernels[l], 0);
+            // Residual
+            for (size_t i = 0; i < (size_t)dim * seq; i++)
+                x[i] += ffn_result[i];
+            free(ffn_result);
+            ane_ffn2 += timer_ms(tf, timer_now());
+        }
+
+        double total2 = timer_ms(t0, timer_now());
+        printf("\n=== Fiber-768 ANE-Only Results (%d tokens, %d layers) ===\n", seq, FIBER_LAYERS);
+        printf("  ANE Attention: %6.1f ms (%5.2f ms/layer)\n", ane_attn2, ane_attn2/FIBER_LAYERS);
+        printf("  ANE FFN:       %6.1f ms (%5.2f ms/layer)\n", ane_ffn2, ane_ffn2/FIBER_LAYERS);
+        printf("  Other:         %6.1f ms\n", total2 - ane_attn2 - ane_ffn2);
+        printf("  Total:         %6.1f ms (%.1f tok/s)\n", total2, (double)seq/(total2/1000.0));
+        printf("====================================================\n");
+
+        for (int l = 0; l < FIBER_LAYERS; l++) ane_free(ffn_kernels[l]);
+    }
 
     // Cleanup
     for (int l = 0; l < FIBER_LAYERS; l++) ane_free(kernels[l]);

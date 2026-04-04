@@ -471,40 +471,38 @@ void fiber_proof_sweep(void) {
 
     printf("\n=== EXTENDED PROOF SWEEP ===\n");
     printf("CPU/AMX vs ANE across configurations. Token match verifies correctness.\n\n");
-    printf("%-5s %-5s %-4s %-5s %-5s | %8s %8s %7s %6s\n",
-           "dim","heads","kv","ffn","lyrs","cpu_ms","ane_ms","speedup","match");
-    printf("--------------------------------------------------------------\n");
+    printf("%-8s %-5s %-5s %-4s %-5s %-4s %-4s | %8s %8s %7s %6s\n",
+           "model","dim","heads","kv","ffn","lyrs","seq","cpu_ms","ane_ms","speedup","match");
+    printf("------------------------------------------------------------------------\n");
 
-    typedef struct { int dim; int heads; int kv_heads; int ffn; int layers; } pconfig;
+    typedef struct { int dim; int heads; int kv_heads; int ffn; int layers; int seq; const char *name; } pconfig;
     pconfig cfgs[] = {
-        // Vary dim (heads=dim/64, MHA, ffn=2.67x, 12 layers)
-        { 256,  4,  4,  684, 12},
-        { 384,  6,  6, 1024, 12},
-        { 512,  8,  8, 1365, 12},
-        { 768, 12, 12, 2048, 12},
-        {1024, 16, 16, 2730,  8},
-        // Vary layers (dim=768)
-        { 768, 12, 12, 2048,  4},
-        { 768, 12, 12, 2048,  8},
-        { 768, 12, 12, 2048, 12},
-        { 768, 12, 12, 2048, 24},
-        // Vary GQA (dim=768, 12 layers)
-        { 768, 12,  4, 2048, 12},
-        { 768, 12,  2, 2048, 12},
-        { 768, 12,  1, 2048, 12},
-        // Vary FFN ratio (dim=768, 12 layers)
-        { 768, 12, 12, 1536, 12},  // 2x
-        { 768, 12, 12, 3072, 12},  // 4x
+        // Small models (full sweep)
+        { 256,  4,  4,  684, 12, 128, "~15M"},
+        { 384,  6,  6, 1024, 12, 128, "~30M"},
+        { 512,  8,  8, 1365, 12, 128, "~50M"},
+        { 768, 12, 12, 2048, 12, 128, "~110M"},
+        // Medium models (~500M-1B)
+        {1024, 16,  8, 2730, 16, 128, "~500M"},
+        {1024, 16,  8, 4096, 24, 128, "~1B"},
+        {1536, 24,  8, 4096, 16, 128, "~1B-wide"},
+        // Large models (~2B-4B) — reduce seq for CPU speed
+        {2048, 32,  8, 5461, 22, 128, "~2B"},
+        {2048, 32,  8, 5461, 32, 128, "~3B"},
+        {2560, 40,  8, 6912, 28, 128, "~4B"},
+        // Depth test at dim=768
+        { 768, 12, 12, 2048, 32, 128, "768d-32L"},
+        { 768, 12, 12, 2048, 48, 128, "768d-48L"},
     };
     int n_cfgs = sizeof(cfgs) / sizeof(cfgs[0]);
 
-    int seq = 128; // fixed, within ANE sweet spot
-    int vocab = 1000; // small vocab for speed (synthetic, no real text)
+    int vocab = 1000; // small vocab for speed
 
     for (int ci = 0; ci < n_cfgs; ci++) {
         pconfig c = cfgs[ci];
         int hd = 64;
         int kv_dim = c.kv_heads * hd;
+        int seq = c.seq;
 
         // Allocate synthetic FP32 weights
         float **wq=calloc(c.layers,sizeof(float*)), **wk=calloc(c.layers,sizeof(float*));
@@ -624,11 +622,12 @@ void fiber_proof_sweep(void) {
 
         // Print result
         bool match = (cpu_tok == ane_tok);
-        printf("%-5d %-5d %-4d %-5d %-5d | %7.1f %7.1f %6.1fx %6s\n",
-               c.dim, c.heads, c.kv_heads, c.ffn, c.layers,
+        printf("%-8s %-5d %-5d %-4d %-5d %-4d %-4d | %7.1f %7.1f %6.1fx %6s\n",
+               c.name, c.dim, c.heads, c.kv_heads, c.ffn, c.layers, c.seq,
                cpu_ms, ane_ms > 0 ? ane_ms : -1,
                ane_ms > 0 ? cpu_ms/ane_ms : 0,
                compile_ok ? (match ? "YES" : "NO") : "FAIL");
+        fflush(stdout); // show progress immediately
 
         // Cleanup
         for(int l=0;l<c.layers;l++){

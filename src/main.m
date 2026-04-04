@@ -194,11 +194,10 @@ int main(int argc, char *argv[]) {
 
         printf("\nPrompt: \"%s\" → %d tokens\n", prompt, n_prompt);
 
-        // ANE compile deferred until we know prompt length is worthwhile
-        // (but uses fixed max_seq=512 for now — exact-seq caused correctness issues)
+        // ANE compile for prompt length (min 128 — ANE matmul dimension constraint)
         if (ane_ctx && n_prompt > 4) {
             t0 = timer_now();
-            int ane_seq = 512; // fixed — exact seq breaks output quality
+            int ane_seq = n_prompt < 128 ? 128 : n_prompt;
             bool ane_ok = ane_attn_compile(ane_ctx, m, ane_seq);
             t1 = timer_now();
             if (ane_ok) {

@@ -9,8 +9,8 @@ um groessere Modelle und laengere Kontexte zu ermoeglichen als jedes existierend
 ## Status
 
 Phase 2 fertig: ANE Attention + GPU FFN (Fiber-Loading).
-- **182 tok/s Prefill**, **36 tok/s Decode** auf TinyLlama-1.1B [MEASURED]
-- 4.5x Prefill-Speedup gegenueber GPU-only Baseline (40 tok/s)
+- **420 tok/s Prefill**, **37 tok/s Decode** auf TinyLlama-1.1B [MEASURED]
+- 10.5x Prefill-Speedup gegenueber GPU-only Baseline (40 tok/s)
 - Fused MIL SDPA mit GQA + RoPE auf ANE, MPS MatrixMultiplication fuer FFN
 - Details: `docs/phase2-findings.md`
 

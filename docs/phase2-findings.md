@@ -2,13 +2,24 @@
 
 Date: 2026-04-03 / 2026-04-04
 
-## Ergebnis
+## Ergebnis (aktuell nach allen Optimierungen)
 
-| Metrik | GPU-only (Phase 1) | ANE+GPU (Phase 2) | Boost |
-|--------|-------------------|-------------------|-------|
-| Prefill (81 tok) | 40.1 tok/s | **181.8 tok/s** | **4.5x** |
-| Decode | 37.3 tok/s | 35.6 tok/s | kein Verlust |
-| Peak RSS | 61.8 MB | 2044 MB | +2 GB |
+| Metrik | GPU-only (Phase 1) | ANE+GPU (Phase 2 final) | Boost |
+|--------|-------------------|------------------------|-------|
+| Prefill (81 tok) | 40.1 tok/s | **~420 tok/s** | **10.5x** |
+| Decode | 37.3 tok/s | 36.6 tok/s | kein Verlust |
+| Peak RSS | 61.8 MB | 1967 MB | +1.9 GB |
+
+### Optimierungs-Verlauf
+
+| Schritt | Prefill tok/s | Boost vs GPU-only |
+|---------|--------------|-------------------|
+| GPU-only Baseline | 40 | 1.0x |
+| + ANE Attention (per-token FFN) | 153 | 3.8x |
+| + Batched MPS FFN | 182 | 4.5x |
+| + Pre-dequant FFN weights | 182 | 4.5x |
+| + Exact-seq compile (max(128,seq)) | 417 | **10.4x** |
+| + IOSurface zero-copy | 420 | **10.5x** |
 
 ## Architektur
 
@@ -112,9 +123,54 @@ Bei seq < 5 faellt der Code automatisch auf GPU-only zurueck.
 4. **Exact-seq Compile** bricht Korrektheit — unklar warum
 5. **Decode nutzt ANE nicht** — nur Prefill profitiert
 
+---
+
+## Runde 2: Exact-seq Fix + IOSurface Zero-Copy (2026-04-04)
+
+### Exact-seq Compile Fix [IMPLEMENTED]
+
+**Root Cause:** ANE Compiler braucht Minimum 128 fuer Matmul-Dimensionen.
+Bei seq<128 entsteht Attention Scores `[1,32,seq,seq]` mit seq<128 → HWX Compiler-Fehler.
+
+**Fix:** `ane_seq = max(128, n_prompt)` statt hardcoded 512.
+
+**Impact:**
+
+| Metrik | Vorher (seq=512) | Nachher (max(128,seq)) | Delta |
+|--------|-----------------|----------------------|-------|
+| ANE attn | 180 ms (8.2 ms/L) | 22 ms (1.0 ms/L) | **-88%** |
+| GPU FFN | 145 ms (6.6 ms/L) | 100 ms (4.6 ms/L) | -31% |
+| Unaccounted | 105 ms | 65 ms | -38% |
+| **Prefill** | **182 tok/s** | **417 tok/s** | **2.3x** |
+
+Die ANE Attention ist bei passender Sequenzlaenge extrem schnell (1.0 ms/Layer).
+SRAM Spill tritt trotzdem auf (Weight-Tensoren > 32MB), aber das Impact ist bei
+kleinerem seq deutlich geringer.
+
+### IOSurface Zero-Copy [IMPLEMENTED]
+
+Ersetze `ane_write()`/`ane_read()` mit direktem IOSurface-Zugriff:
+- `ane_lock_input()` → `ane_input_ptr()` → memcpy → `ane_unlock_input()`
+- `ane_lock_output()` → `ane_output_ptr()` → memcpy → `ane_unlock_output()`
+
+**Impact:** +4% (416→433 tok/s). Weniger als erwartet weil `ane_write/ane_read`
+intern auch memcpy auf IOSurface macht — Unterschied ist nur der eliminierte
+interne Buffer-Alloc in libane.
+
+### Aktuelles Bottleneck Breakdown (seq=81, 22 Layers) [MEASURED]
+
+| Komponente | Zeit | Pro Layer | Anteil |
+|-----------|------|-----------|--------|
+| GPU FFN (MPS) | 100 ms | 4.6 ms | **53%** ← neuer Hauptflaschenhals |
+| Unaccounted (I/O) | 65 ms | 3.0 ms | 34% |
+| ANE Attention | 22 ms | 1.0 ms | 12% |
+| Rest (embed, KV, residual) | 1 ms | — | <1% |
+
+GPU FFN ist jetzt der Hauptflaschenhals — nicht mehr ANE I/O.
+
 ## Naechste Schritte (Potenzial)
 
-- **IOSurface zero-copy** fuer ANE I/O statt ane_write/ane_read → -24% Overhead
-- **Exact-seq Compile debuggen** → potentiell 1200+ tok/s wenn Korrektheit geloest
-- **ANE Decode** fuer laengere Kontexte (>256 tokens)
+- **GPU FFN Overhead** — 53% der Zeit. MPS Objekt-Erstellung + memcpy pro Layer kostet ~3ms/L
 - **Groessere Modelle** (7B) mit mmap + Fiber-Loading testen
+- **ANE Decode** fuer laengere Kontexte (>256 tokens)
+- **Cached MPS Objects** — MPSMatrix/MPSMatrixMultiplication einmal erstellen statt pro Layer

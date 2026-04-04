@@ -233,33 +233,41 @@ bool ane_attn_eval_layer(ane_attn_context_t *ctx, int layer,
     size_t in_bytes = (size_t)dim * compiled_seq * sizeof(_Float16);
     size_t out_bytes = (size_t)out_ch * compiled_seq * sizeof(_Float16);
 
+    // Zero-copy I/O via IOSurface pointers (from libane)
+    ane_lock_input(k, 0);
+    _Float16 *io_in = (_Float16 *)ane_input_ptr(k, 0);
+
     if (seq == compiled_seq) {
-        // Fast path: no padding needed, direct I/O
-        ane_write(k, 0, x_in, in_bytes);
-        if (!ane_eval(k, ANE_QOS_BACKGROUND)) return false;
-        ane_read(k, 0, out, out_bytes);
+        // Fast path: direct copy, no padding
+        memcpy(io_in, x_in, in_bytes);
     } else {
-        // Padded path: use pre-allocated buffers from context
-        if (!ctx->pad_in) {
-            ctx->pad_in = calloc(dim * compiled_seq, sizeof(_Float16));
-            ctx->pad_out = calloc(out_ch * compiled_seq, sizeof(_Float16));
-        }
-        // Copy with stride (channels-first)
-        memset(ctx->pad_in, 0, in_bytes);
+        // Padded path: zero-fill then copy per channel
+        memset(io_in, 0, in_bytes);
         for (int d = 0; d < dim; d++) {
-            memcpy(ctx->pad_in + (size_t)d * compiled_seq,
+            memcpy(io_in + (size_t)d * compiled_seq,
                    x_in + (size_t)d * seq,
                    seq * sizeof(_Float16));
         }
-        ane_write(k, 0, ctx->pad_in, in_bytes);
-        if (!ane_eval(k, ANE_QOS_BACKGROUND)) return false;
-        ane_read(k, 0, ctx->pad_out, out_bytes);
+    }
+    ane_unlock_input(k, 0);
+
+    // Eval
+    if (!ane_eval(k, ANE_QOS_BACKGROUND)) return false;
+
+    // Read output directly from IOSurface
+    ane_lock_output(k, 0);
+    _Float16 *io_out = (_Float16 *)ane_output_ptr(k, 0);
+
+    if (seq == compiled_seq) {
+        memcpy(out, io_out, out_bytes);
+    } else {
         for (int c = 0; c < out_ch; c++) {
             memcpy(out + (size_t)c * seq,
-                   ctx->pad_out + (size_t)c * compiled_seq,
+                   io_out + (size_t)c * compiled_seq,
                    seq * sizeof(_Float16));
         }
     }
+    ane_unlock_output(k, 0);
     return true;
 }
 

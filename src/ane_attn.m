@@ -344,20 +344,19 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
 
     // Working buffers for ANE output
     _Float16 *ane_out = calloc((size_t)out_ch * seq, sizeof(_Float16));
+    double total_ane_ms = 0, total_ffn_ms = 0, total_kv_ms = 0;
+    timer_init(); // ensure timebase is initialized in this compilation unit
 
     // 2. For each layer: ANE attention → residual → GPU FFN → residual
     for (int l = 0; l < n_layers; l++) {
         // a. ANE: full-batch attention (RMSNorm + QKV + RoPE + SDPA + Wo)
+        uint64_t ta = timer_now();
         bool ok = ane_attn_eval_layer(ctx, l, x, dim, seq, ane_out, out_ch);
+        total_ane_ms += timer_ms(ta, timer_now());
         if (!ok) {
             fprintf(stderr, "ANE: prefill layer %d eval failed\n", l);
             break;
         }
-
-        // ANE output layout: [1, dim + 2*kv_dim, 1, seq] channels-first
-        // Channels 0..dim-1: attention output (Wo @ attn)
-        // Channels dim..dim+kv_dim-1: K (roped)
-        // Channels dim+kv_dim..dim+2*kv_dim-1: V
 
         // b. Residual add on CPU: x[d][t] += attn_out[d][t]
         for (size_t i = 0; i < (size_t)dim * seq; i++) {
@@ -365,6 +364,7 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
         }
 
         // c. Store K and V into KV cache
+        uint64_t tk = timer_now();
         //    ANE K output: channels [dim .. dim+kv_dim-1], channels-first [kv_dim, seq]
         //    KV cache layout: [head][pos][dim] = cache[h * max_seq * head_dim + pos * head_dim + d]
         _Float16 *k_out = ane_out + (size_t)dim * seq;      // [kv_dim, seq] channels-first
@@ -382,9 +382,12 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
                 }
             }
         }
+        total_kv_ms += timer_ms(tk, timer_now());
 
         // d. GPU batched FFN: 1 command buffer per layer (MPS matmul)
+        uint64_t tf = timer_now();
         gpu_forward_ffn_batch(gpu, m, l, x, seq);
+        total_ffn_ms += timer_ms(tf, timer_now());
     }
 
     // 3. Classifier: copy last token to GPU, run classifier
@@ -400,6 +403,14 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
     free(ane_out);
 
     double ms = timer_ms(t0, timer_now());
+    printf("\n=== Prefill Breakdown (%d tokens, %d layers) ===\n", seq, n_layers);
+    printf("  ANE attn:  %6.1f ms (%5.1f ms/layer)\n", total_ane_ms, total_ane_ms/n_layers);
+    printf("  GPU FFN:   %6.1f ms (%5.1f ms/layer)\n", total_ffn_ms, total_ffn_ms/n_layers);
+    printf("  KV cache:  %6.1f ms (%5.1f ms/layer)\n", total_kv_ms, total_kv_ms/n_layers);
+    printf("  Other:     %6.1f ms (embed, classifier, residual)\n",
+           ms - total_ane_ms - total_ffn_ms - total_kv_ms);
+    printf("  Total:     %6.1f ms (%.1f tok/s)\n", ms, (double)seq / (ms / 1000.0));
+    printf("===========================================\n");
     return (double)seq / (ms / 1000.0); // tok/s
 }
 

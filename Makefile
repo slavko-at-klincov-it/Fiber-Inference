@@ -15,7 +15,7 @@ METAL_SDK = $(shell xcrun --sdk macosx --show-sdk-path)
 
 SRC = src/main.m src/gguf.c src/model.m src/tokenizer.c src/sampler.c \
       src/kv_cache.m src/gpu_ffn.m src/ane_attn.m src/fiber_model.m src/amx_ffn.m \
-      src/fiber_ckpt.m
+      src/fiber_ckpt.m src/fiber_proof.m
 TARGET = fiber-inference
 
 all: $(TARGET)

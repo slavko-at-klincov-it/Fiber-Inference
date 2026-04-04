@@ -17,6 +17,7 @@
 #include "ane_mil.h"
 #include "fiber_model.h"
 #include "fiber_ckpt.h"
+#include "fiber_proof.h"
 #include "amx_ffn.h"
 #include "timer.h"
 #include <Accelerate/Accelerate.h>
@@ -401,11 +402,18 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Fiber-768 architecture benchmark mode
-        // --arch fiber768 (synthetic) or --arch fiber768:/path/to/ckpt.bin (real weights)
+        // --arch fiber768 or --arch fiber768:/path/to/ckpt.bin
         if (arch_mode && strncmp(arch_mode, "fiber768", 8) == 0) {
             const char *ckpt = strchr(arch_mode, ':');
             run_fiber768_bench(ckpt ? ckpt + 1 : NULL);
+            return 0;
+        }
+
+        // --arch proof — A/B comparison with real text output
+        if (arch_mode && strcmp(arch_mode, "proof") == 0) {
+            const char *ckpt = "/Users/slavkoklincov/Code/ANE-Training/training/training_dynamic/ane_stories110M_dyn_ckpt.bin";
+            const char *gguf = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
+            fiber_proof(ckpt, gguf, prompt);
             return 0;
         }
 

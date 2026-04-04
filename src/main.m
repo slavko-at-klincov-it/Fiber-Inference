@@ -161,26 +161,7 @@ int main(int argc, char *argv[]) {
             printf("Dequantized attention weights: %.1f MB in %.1f ms\n",
                    dq_bytes / (1024.0 * 1024.0), timer_ms(t0, t1));
 
-            // Compile ANE attention kernels
-            t0 = timer_now();
-            bool ane_ok = ane_attn_compile(ane_ctx, m, 512);
-            t1 = timer_now();
-            if (ane_ok) {
-                printf("ANE kernels compiled in %.1f ms\n", timer_ms(t0, t1));
-                // Free dequantized weights (ANE baked them)
-                model_free_attention_fp16(m);
-                printf("Freed FP16 weights, RSS: %.1f MB\n",
-                       model_get_rss() / (1024.0 * 1024.0));
-                // Init batched GPU FFN (MPS matmul)
-                gpu_init_ffn_batch(gpu, m, 512);
-
-                // Quick validation
-                ane_attn_validate(ane_ctx, m);
-            } else {
-                fprintf(stderr, "ANE kernel compilation failed, using GPU-only\n");
-                ane_attn_free(ane_ctx);
-                ane_ctx = NULL;
-            }
+            // ANE compile deferred until we know prompt length (after tokenize)
         } else {
             printf("ANE not available, using GPU-only mode\n");
         }
@@ -212,10 +193,28 @@ int main(int argc, char *argv[]) {
         }
 
         printf("\nPrompt: \"%s\" → %d tokens\n", prompt, n_prompt);
+
+        // ANE compile deferred until we know prompt length is worthwhile
+        // (but uses fixed max_seq=512 for now — exact-seq caused correctness issues)
+        if (ane_ctx && n_prompt > 4) {
+            t0 = timer_now();
+            int ane_seq = 512; // fixed — exact seq breaks output quality
+            bool ane_ok = ane_attn_compile(ane_ctx, m, ane_seq);
+            t1 = timer_now();
+            if (ane_ok) {
+                printf("ANE: %d kernels for max_seq=%d in %.1f ms\n",
+                       m->params.n_layers, ane_seq, timer_ms(t0, t1));
+                model_free_attention_fp16(m);
+                gpu_init_ffn_batch(gpu, m, ane_seq);
+            } else {
+                fprintf(stderr, "ANE compile failed, using GPU-only\n");
+                ane_attn_free(ane_ctx);
+                ane_ctx = NULL;
+            }
+        }
+
         printf("RSS after init: %.1f MB\n", model_get_rss() / (1024.0 * 1024.0));
         printf("\n--- Output ---\n");
-
-        // Print prompt text
         for (int i = 0; i < n_prompt; i++) {
             printf("%s", tokenizer_decode(tok, prompt_tokens[i]));
         }
@@ -224,7 +223,7 @@ int main(int argc, char *argv[]) {
         // ======= Prefill: process all prompt tokens =======
         t0 = timer_now();
         double prefill_tps = 0;
-        if (ane_ctx && n_prompt > 4) {  // ANE prefill only benefits for seq > 4
+        if (ane_ctx && n_prompt > 4) {
             // ANE batched prefill: ANE attention + GPU FFN
             prefill_tps = ane_prefill_batch(ane_ctx, gpu, m, kv,
                                              prompt_tokens, n_prompt);

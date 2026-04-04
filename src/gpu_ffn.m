@@ -37,11 +37,12 @@ struct gpu_context {
     id<MTLBuffer> buf_h3_batch;     // [ffn, max_seq]
     id<MTLBuffer> buf_silu_batch;   // [ffn, max_seq]
     id<MTLBuffer> buf_ffn_out;      // [dim, max_seq]
-    // Reusable FP16 weight buffers (one set, recycled per layer)
-    id<MTLBuffer> buf_w1_fp16;      // [ffn, dim] FP16
-    id<MTLBuffer> buf_w3_fp16;      // [ffn, dim] FP16
-    id<MTLBuffer> buf_w2_fp16;      // [dim, ffn] FP16
-    id<MTLBuffer> buf_rms_ffn_fp16; // [dim] FP16
+    // Per-layer FP16 FFN weight buffers (pre-dequantized at init)
+    id<MTLBuffer> __strong *buf_w1_fp16;      // [n_layers] each [ffn, dim] FP16
+    id<MTLBuffer> __strong *buf_w3_fp16;      // [n_layers] each [ffn, dim] FP16
+    id<MTLBuffer> __strong *buf_w2_fp16;      // [n_layers] each [dim, ffn] FP16
+    id<MTLBuffer> __strong *buf_rms_ffn_fp16; // [n_layers] each [dim] FP16
+    bool ffn_weights_ready;
     // MPS matrix multiply objects
     MPSMatrixMultiplication *mps_mul_hd; // [ffn,dim] × [dim,seq] → [ffn,seq]
     MPSMatrixMultiplication *mps_mul_dh; // [dim,ffn] × [ffn,seq] → [dim,seq]
@@ -257,6 +258,7 @@ bool gpu_init_ffn_batch(gpu_context_t *c, const model_t *m, int max_seq) {
     @autoreleasepool {
         model_params_t p = c->params;
         int dim = p.dim, ffn = p.ffn_dim;
+        int nl = p.n_layers;
         c->batch_max_seq = max_seq;
 
         // Batch activation buffers
@@ -267,11 +269,52 @@ bool gpu_init_ffn_batch(gpu_context_t *c, const model_t *m, int max_seq) {
         c->buf_silu_batch  = make_buf(c->device, ffn * max_seq * 2);
         c->buf_ffn_out     = make_buf(c->device, dim * max_seq * 2);
 
-        // Reusable FP16 weight buffers (recycled per layer)
-        c->buf_w1_fp16     = make_buf(c->device, ffn * dim * 2);
-        c->buf_w3_fp16     = make_buf(c->device, ffn * dim * 2);
-        c->buf_w2_fp16     = make_buf(c->device, dim * ffn * 2);
-        c->buf_rms_ffn_fp16 = make_buf(c->device, dim * 2);
+        // Pre-dequant ALL FFN weights at startup (one-time cost)
+        timer_init();
+        uint64_t td = timer_now();
+        c->buf_w1_fp16      = (__strong id<MTLBuffer> *)calloc(nl, sizeof(id<MTLBuffer>));
+        c->buf_w3_fp16      = (__strong id<MTLBuffer> *)calloc(nl, sizeof(id<MTLBuffer>));
+        c->buf_w2_fp16      = (__strong id<MTLBuffer> *)calloc(nl, sizeof(id<MTLBuffer>));
+        c->buf_rms_ffn_fp16 = (__strong id<MTLBuffer> *)calloc(nl, sizeof(id<MTLBuffer>));
+
+        size_t w_hd = (size_t)ffn * dim * 2;
+        size_t w_dh = (size_t)dim * ffn * 2;
+        size_t total_bytes = 0;
+
+        for (int l = 0; l < nl; l++) {
+            layer_weights_t lw;
+            model_layer_weights(m, l, &lw);
+
+            // Allocate and dequant W1
+            c->buf_w1_fp16[l] = make_buf(c->device, w_hd);
+            _Float16 *w1 = (_Float16 *)((id<MTLBuffer>)c->buf_w1_fp16[l]).contents;
+            for (int r = 0; r < ffn; r++) {
+                if (lw.w1_type == GGML_TYPE_Q4_K) dequant_q4k_row_f16(lw.w1, r, w1 + (size_t)r * dim, dim);
+                else dequant_q6k_row_f16(lw.w1, r, w1 + (size_t)r * dim, dim);
+            }
+            // W3
+            c->buf_w3_fp16[l] = make_buf(c->device, w_hd);
+            _Float16 *w3 = (_Float16 *)((id<MTLBuffer>)c->buf_w3_fp16[l]).contents;
+            for (int r = 0; r < ffn; r++) {
+                if (lw.w3_type == GGML_TYPE_Q4_K) dequant_q4k_row_f16(lw.w3, r, w3 + (size_t)r * dim, dim);
+                else dequant_q6k_row_f16(lw.w3, r, w3 + (size_t)r * dim, dim);
+            }
+            // W2
+            c->buf_w2_fp16[l] = make_buf(c->device, w_dh);
+            _Float16 *w2 = (_Float16 *)((id<MTLBuffer>)c->buf_w2_fp16[l]).contents;
+            for (int r = 0; r < dim; r++) {
+                if (lw.w2_type == GGML_TYPE_Q4_K) dequant_q4k_row_f16(lw.w2, r, w2 + (size_t)r * ffn, ffn);
+                else dequant_q6k_row_f16(lw.w2, r, w2 + (size_t)r * ffn, ffn);
+            }
+            // FFN norm: F32 → FP16
+            c->buf_rms_ffn_fp16[l] = make_buf(c->device, dim * 2);
+            _Float16 *rms = (_Float16 *)((id<MTLBuffer>)c->buf_rms_ffn_fp16[l]).contents;
+            const float *nw = (const float *)lw.ffn_norm;
+            for (int d = 0; d < dim; d++) rms[d] = (_Float16)nw[d];
+
+            total_bytes += w_hd * 2 + w_dh + dim * 2;
+        }
+        c->ffn_weights_ready = true;
 
         // MPS MatrixMultiplication objects
         c->mps_mul_hd = [[MPSMatrixMultiplication alloc]
@@ -279,38 +322,10 @@ bool gpu_init_ffn_batch(gpu_context_t *c, const model_t *m, int max_seq) {
         c->mps_mul_dh = [[MPSMatrixMultiplication alloc]
             initWithDevice:c->device resultRows:dim resultColumns:max_seq interiorColumns:ffn];
 
-        printf("GPU batch FFN: allocated for max_seq=%d (%.1f MB)\n",
-               max_seq, (dim+ffn*3+dim)*max_seq*2.0/(1024*1024) + (ffn*dim*2+dim*ffn)*2.0/(1024*1024));
+        printf("GPU batch FFN: pre-dequant %.1f MB in %.1f ms, max_seq=%d\n",
+               total_bytes / (1024.0*1024.0), timer_ms(td, timer_now()), max_seq);
         return true;
     }
-}
-
-// Dequant one layer's FFN weights into reusable FP16 buffers
-static void dequant_ffn_layer(gpu_context_t *c, const model_t *m, uint32_t layer_idx) {
-    layer_weights_t lw;
-    model_layer_weights(m, layer_idx, &lw);
-    int dim = c->params.dim, ffn = c->params.ffn_dim;
-
-    _Float16 *w1 = (_Float16 *)c->buf_w1_fp16.contents;
-    _Float16 *w3 = (_Float16 *)c->buf_w3_fp16.contents;
-    _Float16 *w2 = (_Float16 *)c->buf_w2_fp16.contents;
-    _Float16 *rms = (_Float16 *)c->buf_rms_ffn_fp16.contents;
-
-    for (int r = 0; r < ffn; r++) {
-        if (lw.w1_type == GGML_TYPE_Q4_K) dequant_q4k_row_f16(lw.w1, r, w1 + (size_t)r * dim, dim);
-        else dequant_q6k_row_f16(lw.w1, r, w1 + (size_t)r * dim, dim);
-    }
-    for (int r = 0; r < ffn; r++) {
-        if (lw.w3_type == GGML_TYPE_Q4_K) dequant_q4k_row_f16(lw.w3, r, w3 + (size_t)r * dim, dim);
-        else dequant_q6k_row_f16(lw.w3, r, w3 + (size_t)r * dim, dim);
-    }
-    for (int r = 0; r < dim; r++) {
-        if (lw.w2_type == GGML_TYPE_Q4_K) dequant_q4k_row_f16(lw.w2, r, w2 + (size_t)r * ffn, ffn);
-        else dequant_q6k_row_f16(lw.w2, r, w2 + (size_t)r * ffn, ffn);
-    }
-    // FFN norm: F32 → FP16
-    const float *nw = (const float *)lw.ffn_norm;
-    for (int d = 0; d < dim; d++) rms[d] = (_Float16)nw[d];
 }
 
 void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
@@ -318,13 +333,10 @@ void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
     @autoreleasepool {
         int dim = c->params.dim, ffn = c->params.ffn_dim;
 
-        // Dequant this layer's FFN weights into reusable buffers
-        dequant_ffn_layer(c, m, layer_idx);
-
         // Copy x (channels-first [dim, seq]) into GPU batch buffer
         memcpy(c->buf_x_batch.contents, x, (size_t)dim * seq * sizeof(_Float16));
 
-        // Build MPS matrix objects for this seq length
+        // MPS matrix descriptors and wrappers
         MPSMatrixDescriptor *desc_x = [MPSMatrixDescriptor
             matrixDescriptorWithRows:dim columns:seq rowBytes:seq*2
             dataType:MPSDataTypeFloat16];
@@ -339,15 +351,14 @@ void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
             dataType:MPSDataTypeFloat16];
 
         MPSMatrix *mat_xnorm = [[MPSMatrix alloc] initWithBuffer:c->buf_xnorm_batch descriptor:desc_x];
-        MPSMatrix *mat_w1 = [[MPSMatrix alloc] initWithBuffer:c->buf_w1_fp16 descriptor:desc_w_hd];
-        MPSMatrix *mat_w3 = [[MPSMatrix alloc] initWithBuffer:c->buf_w3_fp16 descriptor:desc_w_hd];
-        MPSMatrix *mat_w2 = [[MPSMatrix alloc] initWithBuffer:c->buf_w2_fp16 descriptor:desc_w_dh];
+        MPSMatrix *mat_w1 = [[MPSMatrix alloc] initWithBuffer:c->buf_w1_fp16[layer_idx] descriptor:desc_w_hd];
+        MPSMatrix *mat_w3 = [[MPSMatrix alloc] initWithBuffer:c->buf_w3_fp16[layer_idx] descriptor:desc_w_hd];
+        MPSMatrix *mat_w2 = [[MPSMatrix alloc] initWithBuffer:c->buf_w2_fp16[layer_idx] descriptor:desc_w_dh];
         MPSMatrix *mat_h1 = [[MPSMatrix alloc] initWithBuffer:c->buf_h1_batch descriptor:desc_h];
         MPSMatrix *mat_h3 = [[MPSMatrix alloc] initWithBuffer:c->buf_h3_batch descriptor:desc_h];
         MPSMatrix *mat_silu = [[MPSMatrix alloc] initWithBuffer:c->buf_silu_batch descriptor:desc_h];
         MPSMatrix *mat_out = [[MPSMatrix alloc] initWithBuffer:c->buf_ffn_out descriptor:desc_x];
 
-        // Create MPS multipliers for actual seq (may differ from max_seq)
         MPSMatrixMultiplication *mul_hd = [[MPSMatrixMultiplication alloc]
             initWithDevice:c->device resultRows:ffn resultColumns:seq interiorColumns:dim];
         MPSMatrixMultiplication *mul_dh = [[MPSMatrixMultiplication alloc]
@@ -363,7 +374,7 @@ void gpu_forward_ffn_batch(gpu_context_t *c, const model_t *m,
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:c->pipe_rmsnorm_batch];
             [enc setBuffer:c->buf_x_batch offset:0 atIndex:0];
-            [enc setBuffer:c->buf_rms_ffn_fp16 offset:0 atIndex:1];
+            [enc setBuffer:c->buf_rms_ffn_fp16[layer_idx] offset:0 atIndex:1];
             [enc setBuffer:c->buf_xnorm_batch offset:0 atIndex:2];
             [enc setBytes:&dim length:4 atIndex:3];
             [enc setBytes:&seq length:4 atIndex:4];

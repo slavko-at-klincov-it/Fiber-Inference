@@ -19,6 +19,9 @@ struct ane_attn_context {
     // Per-layer compiled kernels (22 layers)
     ANEKernel **kernels;
     int n_layers;
+    // Reusable padded I/O buffers (allocated on first use)
+    _Float16 *pad_in;
+    _Float16 *pad_out;
 };
 
 ane_attn_context_t *ane_attn_init(void) {
@@ -230,32 +233,33 @@ bool ane_attn_eval_layer(ane_attn_context_t *ctx, int layer,
     size_t in_bytes = (size_t)dim * compiled_seq * sizeof(_Float16);
     size_t out_bytes = (size_t)out_ch * compiled_seq * sizeof(_Float16);
 
-    // Write input (pad to compiled_seq if seq < compiled_seq)
-    _Float16 *padded_in = calloc(dim * compiled_seq, sizeof(_Float16));
-    for (int d = 0; d < dim; d++) {
-        memcpy(padded_in + (size_t)d * compiled_seq,
-               x_in + (size_t)d * seq,
-               seq * sizeof(_Float16));
+    if (seq == compiled_seq) {
+        // Fast path: no padding needed, direct I/O
+        ane_write(k, 0, x_in, in_bytes);
+        if (!ane_eval(k, ANE_QOS_BACKGROUND)) return false;
+        ane_read(k, 0, out, out_bytes);
+    } else {
+        // Padded path: use pre-allocated buffers from context
+        if (!ctx->pad_in) {
+            ctx->pad_in = calloc(dim * compiled_seq, sizeof(_Float16));
+            ctx->pad_out = calloc(out_ch * compiled_seq, sizeof(_Float16));
+        }
+        // Copy with stride (channels-first)
+        memset(ctx->pad_in, 0, in_bytes);
+        for (int d = 0; d < dim; d++) {
+            memcpy(ctx->pad_in + (size_t)d * compiled_seq,
+                   x_in + (size_t)d * seq,
+                   seq * sizeof(_Float16));
+        }
+        ane_write(k, 0, ctx->pad_in, in_bytes);
+        if (!ane_eval(k, ANE_QOS_BACKGROUND)) return false;
+        ane_read(k, 0, ctx->pad_out, out_bytes);
+        for (int c = 0; c < out_ch; c++) {
+            memcpy(out + (size_t)c * seq,
+                   ctx->pad_out + (size_t)c * compiled_seq,
+                   seq * sizeof(_Float16));
+        }
     }
-    ane_write(k, 0, padded_in, in_bytes);
-    free(padded_in);
-
-    // Eval
-    bool ok = ane_eval(k, ANE_QOS_BACKGROUND);
-    if (!ok) {
-        fprintf(stderr, "ANE: layer %d eval failed\n", layer);
-        return false;
-    }
-
-    // Read output (trim from compiled_seq to seq)
-    _Float16 *full_out = malloc(out_bytes);
-    ane_read(k, 0, full_out, out_bytes);
-    for (int c = 0; c < out_ch; c++) {
-        memcpy(out + (size_t)c * seq,
-               full_out + (size_t)c * compiled_seq,
-               seq * sizeof(_Float16));
-    }
-    free(full_out);
     return true;
 }
 
@@ -303,6 +307,7 @@ void ane_attn_validate(ane_attn_context_t *ctx, const model_t *m) {
 double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
                           const model_t *m, kv_cache_t *kv,
                           const int *tokens, int n_tokens) {
+    timer_init();
     uint64_t t0 = timer_now();
     int dim = m->params.dim;
     int n_kv_heads = m->params.n_kv_heads;
@@ -315,6 +320,7 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
     // Limit to compiled max sequence length
     if (seq > ctx->max_prefill_seq) seq = ctx->max_prefill_seq;
 
+    uint64_t t_embed = timer_now();
     // 1. Embed all tokens → [dim, seq] FP16 (channels-first for ANE)
     //    Layout: x[d * seq + t] = embedding[token_t][d]
     _Float16 *x = calloc((size_t)dim * seq, sizeof(_Float16));
@@ -342,10 +348,11 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
     }
     free(token_buf);
 
+    double embed_ms = timer_ms(t_embed, timer_now());
+
     // Working buffers for ANE output
     _Float16 *ane_out = calloc((size_t)out_ch * seq, sizeof(_Float16));
-    double total_ane_ms = 0, total_ffn_ms = 0, total_kv_ms = 0;
-    timer_init(); // ensure timebase is initialized in this compilation unit
+    double total_ane_ms = 0, total_ffn_ms = 0, total_kv_ms = 0, total_res_ms = 0;
 
     // 2. For each layer: ANE attention → residual → GPU FFN → residual
     for (int l = 0; l < n_layers; l++) {
@@ -359,9 +366,11 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
         }
 
         // b. Residual add on CPU: x[d][t] += attn_out[d][t]
+        uint64_t tr = timer_now();
         for (size_t i = 0; i < (size_t)dim * seq; i++) {
             x[i] += ane_out[i];
         }
+        total_res_ms += timer_ms(tr, timer_now());
 
         // c. Store K and V into KV cache
         uint64_t tk = timer_now();
@@ -403,14 +412,16 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
     free(ane_out);
 
     double ms = timer_ms(t0, timer_now());
-    printf("\n=== Prefill Breakdown (%d tokens, %d layers) ===\n", seq, n_layers);
-    printf("  ANE attn:  %6.1f ms (%5.1f ms/layer)\n", total_ane_ms, total_ane_ms/n_layers);
-    printf("  GPU FFN:   %6.1f ms (%5.1f ms/layer)\n", total_ffn_ms, total_ffn_ms/n_layers);
-    printf("  KV cache:  %6.1f ms (%5.1f ms/layer)\n", total_kv_ms, total_kv_ms/n_layers);
-    printf("  Other:     %6.1f ms (embed, classifier, residual)\n",
-           ms - total_ane_ms - total_ffn_ms - total_kv_ms);
-    printf("  Total:     %6.1f ms (%.1f tok/s)\n", ms, (double)seq / (ms / 1000.0));
-    printf("===========================================\n");
+    double classified_ms = total_ane_ms + total_ffn_ms + total_kv_ms + total_res_ms + embed_ms;
+    fprintf(stderr, "\n=== Prefill Breakdown (%d tokens, %d layers) ===\n", seq, n_layers);
+    fprintf(stderr, "  Embed:     %6.1f ms\n", embed_ms);
+    fprintf(stderr, "  ANE attn:  %6.1f ms (%5.1f ms/layer)\n", total_ane_ms, total_ane_ms/n_layers);
+    fprintf(stderr, "  Residual:  %6.1f ms (%5.1f ms/layer)\n", total_res_ms, total_res_ms/n_layers);
+    fprintf(stderr, "  KV cache:  %6.1f ms (%5.1f ms/layer)\n", total_kv_ms, total_kv_ms/n_layers);
+    fprintf(stderr, "  GPU FFN:   %6.1f ms (%5.1f ms/layer)\n", total_ffn_ms, total_ffn_ms/n_layers);
+    fprintf(stderr, "  Unaccounted: %5.1f ms (ANE I/O, memcpy, classifier)\n", ms - classified_ms);
+    fprintf(stderr, "  Total:     %6.1f ms (%.1f tok/s)\n", ms, (double)seq / (ms / 1000.0));
+    fprintf(stderr, "===========================================\n");
     return (double)seq / (ms / 1000.0); // tok/s
 }
 
@@ -422,5 +433,7 @@ void ane_attn_free(ane_attn_context_t *ctx) {
         }
         free(ctx->kernels);
     }
+    free(ctx->pad_in);
+    free(ctx->pad_out);
     free(ctx);
 }

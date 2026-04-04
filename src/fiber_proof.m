@@ -258,12 +258,19 @@ void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *promp
     printf("  FIBER PROOF: Same Model, Two Pipelines\n");
     printf("========================================\n\n");
 
-    // 1. Load model
-    fiber_model_t *fm = fiber_model_load_blzt(ckpt_path);
-    if (!fm) return;
-
+    // 1. Load model (detect format by extension)
+    fiber_model_t *fm;
     int dim = 768, heads = 12, kv_heads = 12, hd = 64;
     int ffn_dim = 2048, n_layers = 12, vocab = 32000, max_seq = 256;
+
+    if (strstr(ckpt_path, ".bin") && !strstr(ckpt_path, "ckpt")) {
+        // karpathy format (stories110M.bin)
+        fm = fiber_model_load_karpathy(ckpt_path);
+    } else {
+        // BLZT format (ane_stories110M_dyn_ckpt.bin)
+        fm = fiber_model_load_blzt(ckpt_path);
+    }
+    if (!fm) return;
 
     // 2. Load tokenizer from GGUF
     gguf_file_t *gf = gguf_open(gguf_path);

@@ -23,4 +23,8 @@ typedef struct {
 // Returns NULL on failure.
 fiber_model_t *fiber_model_load_blzt(const char *path);
 
+// Load karpathy/llama2.c format (stories110M.bin, pretrained).
+// Header: 7 ints + sequential FP32 weights.
+fiber_model_t *fiber_model_load_karpathy(const char *path);
+
 #endif

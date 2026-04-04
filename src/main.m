@@ -13,7 +13,12 @@
 #include "kv_cache.h"
 #include "gpu_ffn.h"
 #include "ane_attn.h"
+#include "ane.h"
+#include "ane_mil.h"
+#include "fiber_model.h"
+#include "amx_ffn.h"
 #include "timer.h"
+#include <Accelerate/Accelerate.h>
 
 #define MAX_PROMPT_TOKENS 4096
 
@@ -56,6 +61,156 @@ static void forward_token(gpu_context_t *gpu, const model_t *m,
     gpu_forward_token(gpu, m, kv, pos);
 }
 
+// ============================================================
+// Fiber-768 Architecture Benchmark (synthetic model, no GGUF)
+// ============================================================
+static void run_fiber768_bench(void) {
+    timer_init();
+    printf("\n=== Fiber-768 Architecture Benchmark ===\n");
+    printf("dim=%d, heads=%d (kv=%d), ffn=%d, layers=%d, max_seq=%d\n\n",
+           FIBER_DIM, FIBER_HEADS, FIBER_KV_HEADS, FIBER_FFN_DIM,
+           FIBER_LAYERS, FIBER_MAX_SEQ);
+
+    // 1. Create synthetic model
+    uint64_t t0 = timer_now();
+    fiber_model_t *fm = fiber_model_create();
+    printf("Model created in %.1f ms\n", timer_ms(t0, timer_now()));
+
+    // 2. Init ANE
+    if (ane_init() != 0) { fprintf(stderr, "ANE init failed\n"); return; }
+    ANEDeviceInfo info = ane_device_info();
+    printf("ANE: %s, %d cores\n", info.arch, info.num_cores);
+
+    // 3. Compile ANE attention kernels (using existing ane_mil.h)
+    // We need to create a minimal model_t-like struct for ane_attn_compile
+    // Instead, we compile directly using the MIL generator
+    int seq = FIBER_MAX_SEQ;
+    int dim = FIBER_DIM, kv_dim = FIBER_KV_DIM, out_ch = dim + 2 * kv_dim;
+
+    printf("\nCompiling ANE kernels for seq=%d...\n", seq);
+    t0 = timer_now();
+
+    NSString *mil = gen_sdpa_prefill_mil(dim, FIBER_HEADS, FIBER_KV_HEADS,
+                                          FIBER_HEAD_DIM, seq,
+                                          FIBER_ROPE_BASE, FIBER_RMS_EPS);
+    const char *mil_c = [mil UTF8String];
+    size_t mil_len = strlen(mil_c);
+
+    // Compile one kernel per layer (different weights baked in)
+    ANEKernel *kernels[FIBER_LAYERS];
+    size_t in_bytes = (size_t)dim * seq * sizeof(_Float16);
+    size_t out_bytes_ane = (size_t)out_ch * seq * sizeof(_Float16);
+    int compiled = 0;
+
+    for (int l = 0; l < FIBER_LAYERS; l++) {
+        // Build weight blobs from synthetic FP16 weights
+        ANEWeight weights[8];
+        weights[0] = ane_weight_fp16("@model_path/weights/rms1.bin",
+                                      (const float *)fm->attn_norm[l], 1, dim);
+        weights[1] = ane_weight_fp16("@model_path/weights/wq.bin",
+                                      (const float *)fm->wq[l], dim, dim);
+        weights[2] = ane_weight_fp16("@model_path/weights/wk.bin",
+                                      (const float *)fm->wk[l], kv_dim, dim);
+        weights[3] = ane_weight_fp16("@model_path/weights/wv.bin",
+                                      (const float *)fm->wv[l], kv_dim, dim);
+        weights[4] = ane_weight_fp16("@model_path/weights/wo.bin",
+                                      (const float *)fm->wo[l], dim, dim);
+
+        // cos/sin tables
+        int hd2 = FIBER_HEAD_DIM / 2;
+        float *cos_data = malloc(hd2 * seq * sizeof(float));
+        float *sin_data = malloc(hd2 * seq * sizeof(float));
+        for (int i = 0; i < hd2; i++) {
+            float freq = 1.0f / powf(FIBER_ROPE_BASE, 2.0f * i / (float)FIBER_HEAD_DIM);
+            for (int p = 0; p < seq; p++) {
+                cos_data[i * seq + p] = cosf(p * freq);
+                sin_data[i * seq + p] = sinf(p * freq);
+            }
+        }
+        weights[5] = ane_weight_fp16("@model_path/weights/cos.bin", cos_data, hd2, seq);
+        weights[6] = ane_weight_fp16("@model_path/weights/sin.bin", sin_data, hd2, seq);
+
+        float *mask = malloc(seq * seq * sizeof(float));
+        for (int i = 0; i < seq; i++)
+            for (int j = 0; j < seq; j++)
+                mask[i * seq + j] = (j <= i) ? 0.0f : -65504.0f;
+        weights[7] = ane_weight_fp16("@model_path/weights/mask.bin", mask, seq, seq);
+
+        kernels[l] = ane_compile(mil_c, mil_len, weights, 8,
+                                  1, &in_bytes, 1, &out_bytes_ane, ANE_QOS_BACKGROUND);
+        if (kernels[l]) compiled++;
+
+        for (int w = 0; w < 8; w++) ane_weight_free(&weights[w]);
+        free(cos_data); free(sin_data); free(mask);
+    }
+    printf("ANE: compiled %d/%d kernels in %.1f ms\n",
+           compiled, FIBER_LAYERS, timer_ms(t0, timer_now()));
+
+    if (compiled < FIBER_LAYERS) {
+        fprintf(stderr, "ANE compile failed, aborting\n");
+        fiber_model_free(fm);
+        return;
+    }
+
+    // 4. Create test input (synthetic tokens embedded)
+    _Float16 *x = calloc((size_t)dim * seq, sizeof(_Float16));
+    for (int t = 0; t < seq; t++)
+        for (int d = 0; d < dim; d++)
+            x[(size_t)d * seq + t] = fm->embedding[(size_t)(t % FIBER_VOCAB) * dim + d];
+
+    _Float16 *ane_out = calloc((size_t)out_ch * seq, sizeof(_Float16));
+
+    // 5. Benchmark: ANE Attention + AMX FFN
+    printf("\n--- Benchmark: ANE Attention + AMX FFN ---\n");
+
+    // Warmup
+    ane_write(kernels[0], 0, x, in_bytes);
+    ane_eval(kernels[0], ANE_QOS_BACKGROUND);
+
+    // Timed run
+    double ane_total = 0, amx_total = 0;
+    t0 = timer_now();
+
+    for (int l = 0; l < FIBER_LAYERS; l++) {
+        // ANE Attention
+        uint64_t ta = timer_now();
+        ane_lock_input(kernels[l], 0);
+        memcpy(ane_input_ptr(kernels[l], 0), x, in_bytes);
+        ane_unlock_input(kernels[l], 0);
+        ane_eval(kernels[l], ANE_QOS_BACKGROUND);
+        ane_lock_output(kernels[l], 0);
+        memcpy(ane_out, ane_output_ptr(kernels[l], 0), out_bytes_ane);
+        ane_unlock_output(kernels[l], 0);
+        ane_total += timer_ms(ta, timer_now());
+
+        // Residual
+        for (size_t i = 0; i < (size_t)dim * seq; i++)
+            x[i] += ane_out[i];
+
+        // AMX FFN
+        uint64_t tf = timer_now();
+        amx_forward_ffn_batch(x, dim, FIBER_FFN_DIM, seq,
+                               fm->w1[l], fm->w3[l], fm->w2[l],
+                               fm->ffn_norm[l], FIBER_RMS_EPS);
+        amx_total += timer_ms(tf, timer_now());
+    }
+
+    double total_ms = timer_ms(t0, timer_now());
+    double tok_per_s = (double)seq / (total_ms / 1000.0);
+
+    printf("\n=== Fiber-768 Results (%d tokens, %d layers) ===\n", seq, FIBER_LAYERS);
+    printf("  ANE Attention: %6.1f ms (%5.2f ms/layer)\n", ane_total, ane_total/FIBER_LAYERS);
+    printf("  AMX FFN:       %6.1f ms (%5.2f ms/layer)\n", amx_total, amx_total/FIBER_LAYERS);
+    printf("  Other:         %6.1f ms\n", total_ms - ane_total - amx_total);
+    printf("  Total:         %6.1f ms (%.1f tok/s)\n", total_ms, tok_per_s);
+    printf("===============================================\n");
+
+    // Cleanup
+    for (int l = 0; l < FIBER_LAYERS; l++) ane_free(kernels[l]);
+    free(x); free(ane_out);
+    fiber_model_free(fm);
+}
+
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         const char *model_path = NULL;
@@ -68,6 +223,7 @@ int main(int argc, char *argv[]) {
         int list_tensors_flag = 0;
         int benchmark_flag = 0;
         int no_ane_flag = 0;
+        const char *arch_mode = NULL;
 
         static struct option long_opts[] = {
             {"model",        required_argument, 0, 'm'},
@@ -80,6 +236,7 @@ int main(int argc, char *argv[]) {
             {"list-tensors", no_argument,       0, 't'},
             {"benchmark",    no_argument,       0, 'b'},
             {"no-ane",       no_argument,       0, 'G'},
+            {"arch",         required_argument, 0, 'A'},
             {"help",         no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -97,13 +254,20 @@ int main(int argc, char *argv[]) {
                 case 't': list_tensors_flag = 1; break;
                 case 'b': benchmark_flag = 1; break;
                 case 'G': no_ane_flag = 1; break;
+                case 'A': arch_mode = optarg; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
         }
 
+        // Fiber-768 architecture benchmark mode (no GGUF needed)
+        if (arch_mode && strcmp(arch_mode, "fiber768") == 0) {
+            run_fiber768_bench();
+            return 0;
+        }
+
         if (!model_path) {
-            fprintf(stderr, "Error: --model is required\n");
+            fprintf(stderr, "Error: --model or --arch fiber768 is required\n");
             print_usage(argv[0]);
             return 1;
         }

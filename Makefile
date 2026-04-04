@@ -14,7 +14,7 @@ FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceS
 METAL_SDK = $(shell xcrun --sdk macosx --show-sdk-path)
 
 SRC = src/main.m src/gguf.c src/model.m src/tokenizer.c src/sampler.c \
-      src/kv_cache.m src/gpu_ffn.m src/ane_attn.m
+      src/kv_cache.m src/gpu_ffn.m src/ane_attn.m src/fiber_model.m src/amx_ffn.m
 TARGET = fiber-inference
 
 all: $(TARGET)

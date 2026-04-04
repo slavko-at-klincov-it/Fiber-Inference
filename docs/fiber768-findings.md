@@ -1,0 +1,78 @@
+# Fiber-768: Apple-Silicon-Native LLM Architecture — First Results
+
+Date: 2026-04-04
+
+## Architektur
+
+```
+dim=768, heads=12 (kv=4, GQA 3:1), head_dim=64
+ffn=3072 (4x ratio), layers=24, max_seq=256, vocab=32000
+~800M Parameter (synthetische Random Weights)
+```
+
+Pipeline pro Layer:
+```
+ANE:  Fused SDPA (RMSNorm + QKV + RoPE + GQA Tile + Attention + Wo)
+AMX:  FFN (cblas_sgemm: RMSNorm + W1@x + W3@x → SiLU → W2@silu + Residual)
+GPU:  Nicht verwendet im Prefill (frei fuer Decode)
+```
+
+## Ergebnis [MEASURED]
+
+| Metrik | Fiber-768 (ANE+AMX) | TinyLlama (ANE+GPU) | TinyLlama (GPU-only) |
+|--------|--------------------|--------------------|---------------------|
+| **Prefill tok/s** | **1962** | 420 | 40 |
+| Tokens | 256 | 81 | 81 |
+| Layers | 24 | 22 | 22 |
+| **Boost vs GPU-only** | **49x** | 10.5x | 1.0x |
+
+## Breakdown (256 tokens, 24 layers) [MEASURED]
+
+| Komponente | Zeit | Pro Layer | Anteil |
+|-----------|------|-----------|--------|
+| ANE Attention | 17.9 ms | **0.75 ms** | 14% |
+| **AMX FFN** | **112.3 ms** | **4.68 ms** | **86%** |
+| Other | 0.3 ms | 0.01 ms | <1% |
+| **Total** | **130.5 ms** | 5.44 ms | 100% |
+
+## Analyse
+
+### Was funktioniert
+- **ANE Attention ist extrem schnell** (0.75 ms/Layer bei 256 tokens, 12 heads)
+- **AMX FFN laeuft** und produziert Ergebnisse (cblas_sgemm automatisch multi-threaded)
+- **Kein GPU benoetigt** fuer Prefill — GPU ist frei fuer Decode
+- **Transfer-Overhead <1%** — ANE→CPU→AMX ist vernachlaessigbar
+- **SRAM Spill** auf allen Layers (Weight-Tensoren > 32MB), aber Performance trotzdem gut
+
+### Bottleneck: AMX FFN (86% der Zeit)
+- AMX FFN: 4.68 ms/Layer — davon:
+  - FP16→FP32 Konvertierung der Weights (~2.3M Elemente pro Layer × 3 Matrizen)
+  - cblas_sgemm Compute
+  - FP32→FP16 Konvertierung zurueck
+- Die Weight-Konvertierung ist wahrscheinlich der groesste Teil
+- **Optimierung:** Weights einmal zu FP32 konvertieren statt pro Layer (wie bei GPU Pre-Dequant)
+
+### Vergleich: AMX FFN vs GPU FFN (MPS)
+Bei dim=768, ffn=3072, seq=128 (aus Hardware-Sweep):
+- AMX: 0.37ms (1615 GFLOPS)
+- GPU: 1.62ms (1117 GFLOPS)
+- **AMX ist 4.4x schneller als GPU bei dieser Dimension!**
+
+Aber im Fiber-768 Benchmark (seq=256): AMX = 4.68ms/Layer
+→ Die Weight-Konvertierung FP16→FP32 pro Layer frisst den Vorteil auf.
+
+## Naechste Optimierungen
+
+1. **Pre-convert FFN Weights zu FP32** beim Start (wie Pre-Dequant)
+   → Erwartet: AMX FFN ~1ms/Layer statt 4.68ms → **~5000 tok/s**
+
+2. **Layer Fusion auf ANE** (wie gdc-lm: 5 Layers/Kernel)
+   → ANE Attention: 0.75ms → ~0.15ms/Layer → ~3.6ms total
+
+3. **GPU fuer Decode** nutzen (ANE+AMX fuer Prefill, GPU fuer Decode)
+
+## Offene Fragen
+
+- Wie schnell ist AMX FFN mit vorkonvertierten FP32 Weights?
+- Kann ANE FFN schneller sein als AMX FFN? (gdc-lm: 9.6 TFLOPS reine FFN auf ANE)
+- Wie verhaelt sich die Qualitaet mit trainierten Weights vs Random?

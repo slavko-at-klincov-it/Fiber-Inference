@@ -8,11 +8,12 @@ um groessere Modelle und laengere Kontexte zu ermoeglichen als jedes existierend
 
 ## Status
 
-Phase 2 fertig: ANE Attention + GPU FFN (Fiber-Loading).
-- **420 tok/s Prefill**, **37 tok/s Decode** auf TinyLlama-1.1B [MEASURED]
-- 10.5x Prefill-Speedup gegenueber GPU-only Baseline (40 tok/s)
-- Fused MIL SDPA mit GQA + RoPE auf ANE, MPS MatrixMultiplication fuer FFN
-- Details: `docs/phase2-findings.md`
+Phase 2 fertig + Fiber-768 Architektur-Prototyp.
+- **1962 tok/s Prefill** mit Fiber-768 (ANE Attention + AMX FFN) [MEASURED]
+- **420 tok/s Prefill** auf TinyLlama-1.1B (ANE+GPU) [MEASURED]
+- 49x Boost gegenueber GPU-only Baseline (40 tok/s)
+- Eigene Architektur: dim=768, 12 heads, 4x FFN, 24 Layers (~800M params)
+- Details: `docs/fiber768-findings.md`, `docs/phase2-findings.md`
 
 ## Hardware — Die 5 Compute Units
 

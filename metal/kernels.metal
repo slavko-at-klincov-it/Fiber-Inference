@@ -54,7 +54,7 @@ kernel void q4k_matvec_mr(
     uint tid [[thread_position_in_threadgroup]])
 {
     const int ROWS_PER_TG = 4;
-    const int THREADS_PER_ROW = 64; // 2 SIMD groups
+    const int THREADS_PER_ROW = 64; // 2 SIMD groups per row
     int local_row = int(tid) / THREADS_PER_ROW;
     int local_tid = int(tid) % THREADS_PER_ROW;
     int row = int(tgid) * ROWS_PER_TG + local_row;
@@ -94,7 +94,7 @@ kernel void q4k_matvec_mr(
 
     // Reduce within the 64-thread row group (2 SIMD groups)
     float simd_total = simd_sum(sum);
-    threadgroup float row_shared[8]; // 2 simd groups per row × 4 rows
+    threadgroup float row_shared[8];
     int simd_idx = local_tid / 32;
     if ((local_tid & 31) == 0) row_shared[local_row * 2 + simd_idx] = simd_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);

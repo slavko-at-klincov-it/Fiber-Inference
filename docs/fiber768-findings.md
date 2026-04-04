@@ -143,9 +143,24 @@ AMX und GPU werden frei fuer:
 **10,241 tok/s bei 800M Parametern auf einem Mac Mini.**
 Das ist schneller als die meisten NVIDIA Server-GPUs fuer vergleichbare Modellgroessen.
 
+---
+
+## Stories-110M mit echten Weights: 21,490 tok/s [MEASURED]
+
+Checkpoint: `ANE-Training/training/training_dynamic/ane_stories110M_dyn_ckpt.bin`
+Config: dim=768, hidden=2048, heads=12 (MHA), 12 Layers, vocab=32000
+Training: Step 4700/5000, loss=4.04
+
+| Pipeline | tok/s | ms/Layer (Attn) | ms/Layer (FFN) |
+|----------|-------|----------------|----------------|
+| ANE Attn + AMX FFN | 5,241 | 0.83 | 3.23 |
+| **ANE Attn + ANE FFN** | **21,490** | **0.59** | **0.40** |
+
+**537x schneller als GPU-only.** Die per-Layer Zahlen sind konsistent
+mit den synthetischen Benchmarks — echte Weights aendern die Speed nicht.
+
 ## Offene Fragen
 
-- Kann ANE Attention + ANE FFN in **einem** fused Kernel laufen? (gdc-lm: 17 nodes/layer, 3 Layer max)
-- Wie verhaelt sich die Qualitaet mit trainierten Weights vs Random?
+- Wie ist die **Textqualitaet**? (Braucht Decoder + Sampling)
 - Skaliert das zu groesseren Modellen (2B, 7B)?
-- Laesst sich das Modell trainieren? (ANE-Training hat 2.43 TFLOPS Training bewiesen)
+- Laesst sich das Modell mit unserer Architektur trainieren?

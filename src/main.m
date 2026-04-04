@@ -16,6 +16,7 @@
 #include "ane.h"
 #include "ane_mil.h"
 #include "fiber_model.h"
+#include "fiber_ckpt.h"
 #include "amx_ffn.h"
 #include "timer.h"
 #include <Accelerate/Accelerate.h>
@@ -64,33 +65,47 @@ static void forward_token(gpu_context_t *gpu, const model_t *m,
 // ============================================================
 // Fiber-768 Architecture Benchmark (synthetic model, no GGUF)
 // ============================================================
-static void run_fiber768_bench(void) {
+static void run_fiber768_bench(const char *ckpt_path) {
     timer_init();
     printf("\n=== Fiber-768 Architecture Benchmark ===\n");
-    printf("dim=%d, heads=%d (kv=%d), ffn=%d, layers=%d, max_seq=%d\n\n",
-           FIBER_DIM, FIBER_HEADS, FIBER_KV_HEADS, FIBER_FFN_DIM,
-           FIBER_LAYERS, FIBER_MAX_SEQ);
 
-    // 1. Create synthetic model
+    // 1. Create or load model
     uint64_t t0 = timer_now();
-    fiber_model_t *fm = fiber_model_create();
-    printf("Model created in %.1f ms\n", timer_ms(t0, timer_now()));
+    fiber_model_t *fm;
+    int actual_layers, actual_dim, actual_ffn, actual_heads, actual_kv_heads;
+
+    if (ckpt_path) {
+        fm = fiber_model_load_blzt(ckpt_path);
+        if (!fm) return;
+        // Stories-110M: dim=768, hidden=2048, heads=12, kv=12 (MHA), 12 layers
+        actual_layers = 12; actual_dim = 768; actual_ffn = 2048;
+        actual_heads = 12; actual_kv_heads = 12;
+    } else {
+        fm = fiber_model_create();
+        actual_layers = FIBER_LAYERS; actual_dim = FIBER_DIM; actual_ffn = FIBER_FFN_DIM;
+        actual_heads = FIBER_HEADS; actual_kv_heads = FIBER_KV_HEADS;
+    }
+    printf("dim=%d, heads=%d (kv=%d), ffn=%d, layers=%d, max_seq=%d\n\n",
+           actual_dim, actual_heads, actual_kv_heads, actual_ffn,
+           actual_layers, FIBER_MAX_SEQ);
+    printf("Model ready in %.1f ms\n", timer_ms(t0, timer_now()));
 
     // 2. Init ANE
     if (ane_init() != 0) { fprintf(stderr, "ANE init failed\n"); return; }
     ANEDeviceInfo info = ane_device_info();
     printf("ANE: %s, %d cores\n", info.arch, info.num_cores);
 
-    // 3. Compile ANE attention kernels (using existing ane_mil.h)
-    // We need to create a minimal model_t-like struct for ane_attn_compile
-    // Instead, we compile directly using the MIL generator
+    // 3. Compile ANE attention kernels
     int seq = FIBER_MAX_SEQ;
-    int dim = FIBER_DIM, kv_dim = FIBER_KV_DIM, out_ch = dim + 2 * kv_dim;
+    int dim = actual_dim;
+    int kv_dim = actual_kv_heads * FIBER_HEAD_DIM;
+    int out_ch = dim + 2 * kv_dim;
+    int n_layers_use = actual_layers;
 
     printf("\nCompiling ANE kernels for seq=%d...\n", seq);
     t0 = timer_now();
 
-    NSString *mil = gen_sdpa_prefill_mil(dim, FIBER_HEADS, FIBER_KV_HEADS,
+    NSString *mil = gen_sdpa_prefill_mil(dim, actual_heads, actual_kv_heads,
                                           FIBER_HEAD_DIM, seq,
                                           FIBER_ROPE_BASE, FIBER_RMS_EPS);
     const char *mil_c = [mil UTF8String];
@@ -102,7 +117,7 @@ static void run_fiber768_bench(void) {
     size_t out_bytes_ane = (size_t)out_ch * seq * sizeof(_Float16);
     int compiled = 0;
 
-    for (int l = 0; l < FIBER_LAYERS; l++) {
+    for (int l = 0; l < n_layers_use; l++) {
         // Build weight blobs from synthetic FP16 weights
         ANEWeight weights[8];
         weights[0] = ane_weight_fp16("@model_path/weights/rms1.bin",
@@ -144,9 +159,9 @@ static void run_fiber768_bench(void) {
         free(cos_data); free(sin_data); free(mask);
     }
     printf("ANE: compiled %d/%d kernels in %.1f ms\n",
-           compiled, FIBER_LAYERS, timer_ms(t0, timer_now()));
+           compiled, n_layers_use, timer_ms(t0, timer_now()));
 
-    if (compiled < FIBER_LAYERS) {
+    if (compiled < n_layers_use) {
         fprintf(stderr, "ANE compile failed, aborting\n");
         fiber_model_free(fm);
         return;
@@ -171,7 +186,7 @@ static void run_fiber768_bench(void) {
     double ane_total = 0, amx_total = 0;
     t0 = timer_now();
 
-    for (int l = 0; l < FIBER_LAYERS; l++) {
+    for (int l = 0; l < n_layers_use; l++) {
         // ANE Attention
         uint64_t ta = timer_now();
         ane_lock_input(kernels[l], 0);
@@ -188,7 +203,7 @@ static void run_fiber768_bench(void) {
 
         // AMX FFN
         uint64_t tf = timer_now();
-        amx_forward_ffn_batch_f32(x, dim, FIBER_FFN_DIM, seq,
+        amx_forward_ffn_batch_f32(x, dim, actual_ffn, seq,
                                    fm->w1_f32[l], fm->w3_f32[l], fm->w2_f32[l],
                                    fm->ffn_norm_f32[l], FIBER_RMS_EPS);
         amx_total += timer_ms(tf, timer_now());
@@ -197,9 +212,9 @@ static void run_fiber768_bench(void) {
     double total_ms = timer_ms(t0, timer_now());
     double tok_per_s = (double)seq / (total_ms / 1000.0);
 
-    printf("\n=== Fiber-768 Results (%d tokens, %d layers) ===\n", seq, FIBER_LAYERS);
-    printf("  ANE Attention: %6.1f ms (%5.2f ms/layer)\n", ane_total, ane_total/FIBER_LAYERS);
-    printf("  AMX FFN:       %6.1f ms (%5.2f ms/layer)\n", amx_total, amx_total/FIBER_LAYERS);
+    printf("\n=== Fiber-768 Results (%d tokens, %d layers) ===\n", seq, n_layers_use);
+    printf("  ANE Attention: %6.1f ms (%5.2f ms/layer)\n", ane_total, ane_total/n_layers_use);
+    printf("  AMX FFN:       %6.1f ms (%5.2f ms/layer)\n", amx_total, amx_total/n_layers_use);
     printf("  Other:         %6.1f ms\n", total_ms - ane_total - amx_total);
     printf("  Total:         %6.1f ms (%.1f tok/s)\n", total_ms, tok_per_s);
     printf("===============================================\n");
@@ -210,7 +225,7 @@ static void run_fiber768_bench(void) {
     printf("\n--- Benchmark B: ANE Attention + ANE FFN ---\n");
     printf("Compiling ANE FFN kernels...\n");
 
-    NSString *ffn_mil = gen_ffn_only_mil(dim, FIBER_FFN_DIM, seq, FIBER_RMS_EPS);
+    NSString *ffn_mil = gen_ffn_only_mil(dim, actual_ffn, seq, FIBER_RMS_EPS);
     const char *ffn_mil_c = [ffn_mil UTF8String];
     size_t ffn_mil_len = strlen(ffn_mil_c);
     size_t ffn_out_bytes = (size_t)dim * seq * sizeof(_Float16);
@@ -218,17 +233,17 @@ static void run_fiber768_bench(void) {
     ANEKernel *ffn_kernels[FIBER_LAYERS];
     int ffn_compiled = 0;
     t0 = timer_now();
-    for (int l = 0; l < FIBER_LAYERS; l++) {
+    for (int l = 0; l < n_layers_use; l++) {
         ANEWeight fw[4];
         // Use FP32 versions for ane_weight_fp16 (which expects float* and converts)
         fw[0] = ane_weight_fp16("@model_path/weights/ffn_norm.bin",
                                  fm->ffn_norm_f32[l], 1, dim);
         fw[1] = ane_weight_fp16("@model_path/weights/w1.bin",
-                                 fm->w1_f32[l], FIBER_FFN_DIM, dim);
+                                 fm->w1_f32[l], actual_ffn, dim);
         fw[2] = ane_weight_fp16("@model_path/weights/w3.bin",
-                                 fm->w3_f32[l], FIBER_FFN_DIM, dim);
+                                 fm->w3_f32[l], actual_ffn, dim);
         fw[3] = ane_weight_fp16("@model_path/weights/w2.bin",
-                                 fm->w2_f32[l], dim, FIBER_FFN_DIM);
+                                 fm->w2_f32[l], dim, actual_ffn);
 
         ffn_kernels[l] = ane_compile(ffn_mil_c, ffn_mil_len, fw, 4,
                                       1, &in_bytes, 1, &ffn_out_bytes, ANE_QOS_BACKGROUND);
@@ -236,9 +251,9 @@ static void run_fiber768_bench(void) {
         for (int w = 0; w < 4; w++) ane_weight_free(&fw[w]);
     }
     printf("ANE FFN: compiled %d/%d in %.1f ms (budget: %d/119)\n",
-           ffn_compiled, FIBER_LAYERS, timer_ms(t0, timer_now()), ane_compile_count());
+           ffn_compiled, n_layers_use, timer_ms(t0, timer_now()), ane_compile_count());
 
-    if (ffn_compiled == FIBER_LAYERS) {
+    if (ffn_compiled == n_layers_use) {
         // Reset x to embeddings
         for (int t = 0; t < seq; t++)
             for (int d = 0; d < dim; d++)
@@ -251,7 +266,7 @@ static void run_fiber768_bench(void) {
         double ane_attn2 = 0, ane_ffn2 = 0;
         t0 = timer_now();
 
-        for (int l = 0; l < FIBER_LAYERS; l++) {
+        for (int l = 0; l < n_layers_use; l++) {
             // ANE Attention
             uint64_t ta = timer_now();
             ane_lock_input(kernels[l], 0);
@@ -280,18 +295,18 @@ static void run_fiber768_bench(void) {
         }
 
         double total2 = timer_ms(t0, timer_now());
-        printf("\n=== Fiber-768 ANE-Only Results (%d tokens, %d layers) ===\n", seq, FIBER_LAYERS);
-        printf("  ANE Attention: %6.1f ms (%5.2f ms/layer)\n", ane_attn2, ane_attn2/FIBER_LAYERS);
-        printf("  ANE FFN:       %6.1f ms (%5.2f ms/layer)\n", ane_ffn2, ane_ffn2/FIBER_LAYERS);
+        printf("\n=== Fiber-768 ANE-Only Results (%d tokens, %d layers) ===\n", seq, n_layers_use);
+        printf("  ANE Attention: %6.1f ms (%5.2f ms/layer)\n", ane_attn2, ane_attn2/n_layers_use);
+        printf("  ANE FFN:       %6.1f ms (%5.2f ms/layer)\n", ane_ffn2, ane_ffn2/n_layers_use);
         printf("  Other:         %6.1f ms\n", total2 - ane_attn2 - ane_ffn2);
         printf("  Total:         %6.1f ms (%.1f tok/s)\n", total2, (double)seq/(total2/1000.0));
         printf("====================================================\n");
 
-        for (int l = 0; l < FIBER_LAYERS; l++) ane_free(ffn_kernels[l]);
+        for (int l = 0; l < n_layers_use; l++) ane_free(ffn_kernels[l]);
     }
 
     // Cleanup
-    for (int l = 0; l < FIBER_LAYERS; l++) ane_free(kernels[l]);
+    for (int l = 0; l < n_layers_use; l++) ane_free(kernels[l]);
     free(x); free(ane_out);
     fiber_model_free(fm);
 }
@@ -345,9 +360,11 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // Fiber-768 architecture benchmark mode (no GGUF needed)
-        if (arch_mode && strcmp(arch_mode, "fiber768") == 0) {
-            run_fiber768_bench();
+        // Fiber-768 architecture benchmark mode
+        // --arch fiber768 (synthetic) or --arch fiber768:/path/to/ckpt.bin (real weights)
+        if (arch_mode && strncmp(arch_mode, "fiber768", 8) == 0) {
+            const char *ckpt = strchr(arch_mode, ':');
+            run_fiber768_bench(ckpt ? ckpt + 1 : NULL);
             return 0;
         }
 

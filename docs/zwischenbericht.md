@@ -138,6 +138,26 @@ ANE Single-Token-Decode profitiert nicht weil der IOSurface Dispatch-Overhead
 
 ---
 
+## Update 2026-04-04 (Nacht): Fundamentale ANE Limits entdeckt
+
+Drei fortgeschrittene Features systematisch getestet — alle drei scheitern:
+
+| Feature | Ergebnis | Ursache | Dokumentation |
+|---------|----------|---------|--------------|
+| **INT8 Weights** | Compile Fail | MIL deklariert FP16, Compiler lehnt INT8 Blobs ab | docs/int8-findings.md |
+| **Sliding Window** | 0% Speedup | Q@K^T Matmul berechnet immer alle seq×seq Elemente | docs/sliding-window-findings.md |
+| **Dynamic Weights** | Compile Fail ab IC≥256 | Input-Tensor zu gross fuer ANE Compiler | docs/dynamic-weights-findings.md |
+
+**Kernaussage:** Der ANE ist ein **Prefill-Spezialist mit baked Weights**.
+Er ist extrem schnell (10K+ tok/s) fuer das was er kann, aber hat harte
+Constraints die fortgeschrittene Features verhindern:
+- Decode braucht dynamischen KV Cache → ANE kann nicht
+- INT8 braucht MIL-Level Typenwechsel → nicht trivial
+- Sliding Window braucht Matmul-Level Aenderung → nicht per Mask machbar
+
+**Praktische Konsequenz:** Die optimale Architektur ist **ANE Prefill + GPU/CPU Decode**.
+Nicht "alles auf ANE" sondern "das Richtige auf der richtigen Unit".
+
 ## Update 2026-04-04 (Spaetabend)
 
 ### Ziel 1: Kohaerenter Text — ERREICHT

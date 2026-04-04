@@ -221,6 +221,31 @@ kernel void rmsnorm(
 }
 
 // ============================================================
+// Batched RMSNorm — channels-first [dim, seq] layout
+// One thread per token, loops over dim
+// ============================================================
+kernel void rmsnorm_batch(
+    device const half *x   [[buffer(0)]],   // [dim, seq] channels-first
+    device const half *w   [[buffer(1)]],   // [dim] FP16 norm weights
+    device half *out       [[buffer(2)]],   // [dim, seq] channels-first
+    constant int &dim      [[buffer(3)]],
+    constant int &seq      [[buffer(4)]],
+    constant float &eps    [[buffer(5)]],
+    uint t [[thread_position_in_grid]])
+{
+    if (int(t) >= seq) return;
+    float ss = 0.0f;
+    for (int d = 0; d < dim; d++) {
+        float v = float(x[d * seq + t]);
+        ss += v * v;
+    }
+    float rrms = 1.0f / sqrt(ss / float(dim) + eps);
+    for (int d = 0; d < dim; d++) {
+        out[d * seq + t] = half(float(x[d * seq + t]) * rrms * float(w[d]));
+    }
+}
+
+// ============================================================
 // SiLU Gate — FP16
 // ============================================================
 kernel void silu_gate(

@@ -67,6 +67,7 @@ int main(int argc, char *argv[]) {
         float top_p = 0.9f;
         int list_tensors_flag = 0;
         int benchmark_flag = 0;
+        int no_ane_flag = 0;
 
         static struct option long_opts[] = {
             {"model",        required_argument, 0, 'm'},
@@ -78,6 +79,7 @@ int main(int argc, char *argv[]) {
             {"top-p",        required_argument, 0, 'P'},
             {"list-tensors", no_argument,       0, 't'},
             {"benchmark",    no_argument,       0, 'b'},
+            {"no-ane",       no_argument,       0, 'G'},
             {"help",         no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -94,6 +96,7 @@ int main(int argc, char *argv[]) {
                 case 'P': top_p = (float)atof(optarg); break;
                 case 't': list_tensors_flag = 1; break;
                 case 'b': benchmark_flag = 1; break;
+                case 'G': no_ane_flag = 1; break;
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
@@ -141,8 +144,12 @@ int main(int argc, char *argv[]) {
         printf("GPU initialized in %.1f ms\n", timer_ms(t0, t1));
 
         // ======= Initialize ANE =======
+        ane_attn_context_t *ane_ctx = NULL;
+        if (no_ane_flag) {
+            printf("ANE disabled (--no-ane)\n");
+        } else {
         t0 = timer_now();
-        ane_attn_context_t *ane_ctx = ane_attn_init();
+        ane_ctx = ane_attn_init();
         t1 = timer_now();
         if (ane_ctx) {
             printf("ANE initialized in %.1f ms\n", timer_ms(t0, t1));
@@ -164,6 +171,9 @@ int main(int argc, char *argv[]) {
                 model_free_attention_fp16(m);
                 printf("Freed FP16 weights, RSS: %.1f MB\n",
                        model_get_rss() / (1024.0 * 1024.0));
+                // Init batched GPU FFN (MPS matmul)
+                gpu_init_ffn_batch(gpu, m, 512);
+
                 // Quick validation
                 ane_attn_validate(ane_ctx, m);
             } else {
@@ -174,6 +184,7 @@ int main(int argc, char *argv[]) {
         } else {
             printf("ANE not available, using GPU-only mode\n");
         }
+        } // end !no_ane_flag
 
         // ======= Initialize KV cache =======
         kv_cache_t *kv = kv_cache_init(gpu_get_device(gpu),
@@ -213,7 +224,7 @@ int main(int argc, char *argv[]) {
         // ======= Prefill: process all prompt tokens =======
         t0 = timer_now();
         double prefill_tps = 0;
-        if (ane_ctx && n_prompt > 1) {
+        if (ane_ctx && n_prompt > 4) {  // ANE prefill only benefits for seq > 4
             // ANE batched prefill: ANE attention + GPU FFN
             prefill_tps = ane_prefill_batch(ane_ctx, gpu, m, kv,
                                              prompt_tokens, n_prompt);

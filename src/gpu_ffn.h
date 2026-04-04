@@ -32,6 +32,14 @@ void gpu_forward_ffn_layer(gpu_context_t *ctx, const model_t *m,
 // Classifier-only: RMSNorm + output projection on current buf_x → logits.
 void gpu_forward_classifier(gpu_context_t *ctx, const model_t *m);
 
+// Initialize batched FFN (allocate batch buffers + MPS objects)
+bool gpu_init_ffn_batch(gpu_context_t *ctx, const model_t *m, int max_seq);
+
+// Batched FFN for one layer: operates on [dim, seq] channels-first buffer in-place.
+// Dequants weights on-the-fly, uses MPS for matmul.
+void gpu_forward_ffn_batch(gpu_context_t *ctx, const model_t *m,
+                            uint32_t layer_idx, _Float16 *x, int seq);
+
 #ifdef __OBJC__
 id<MTLDevice> gpu_get_device(gpu_context_t *ctx);
 #endif

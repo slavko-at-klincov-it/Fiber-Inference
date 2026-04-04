@@ -383,18 +383,8 @@ double ane_prefill_batch(ane_attn_context_t *ctx, gpu_context_t *gpu,
             }
         }
 
-        // d. GPU FFN: batch all tokens in one command buffer per layer
-        //    Single CB with seq dispatches of each kernel = much faster than seq CBs
-        {
-            _Float16 *gpu_x = gpu_get_buf_x(gpu);
-            for (int t = 0; t < seq; t++) {
-                for (int d = 0; d < dim; d++)
-                    gpu_x[d] = x[(size_t)d * seq + t];
-                gpu_forward_ffn_layer(gpu, m, l);
-                for (int d = 0; d < dim; d++)
-                    x[(size_t)d * seq + t] = gpu_x[d];
-            }
-        }
+        // d. GPU batched FFN: 1 command buffer per layer (MPS matmul)
+        gpu_forward_ffn_batch(gpu, m, l, x, seq);
     }
 
     // 3. Classifier: copy last token to GPU, run classifier

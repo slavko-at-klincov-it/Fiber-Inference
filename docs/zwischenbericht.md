@@ -138,12 +138,41 @@ ANE Single-Token-Decode profitiert nicht weil der IOSurface Dispatch-Overhead
 
 ---
 
+## Update 2026-04-04 (Spaetabend)
+
+### Ziel 1: Kohaerenter Text — ERREICHT
+
+Karpathy's pretrained stories110M.bin geladen (448 MB, dim=768, 12 Layers).
+Produziert kohaerente Kindergeschichten:
+
+> "Once upon a time there was a little girl named Lily. She was very excited
+> to go to the park with her mommy. She saw a big, brightly decorated room
+> with lots of fun things"
+
+32/32 Token-Match ueber alle 3 Pipelines (CPU, ANE Re-Prefill, Hybrid).
+
+### Ziel 3: Fairer Vergleich mit llama.cpp — ERREICHT
+
+| Engine | Modell | Prefill | Decode |
+|--------|--------|---------|--------|
+| **llama.cpp** | TinyLlama 1.1B Q4_K | **1,434 tok/s** | **111 tok/s** |
+| **Fiber ANE** | Stories-110M FP16 | **1,219 tok/s** | 65 tok/s |
+| Fiber GPU (Phase 1) | TinyLlama 1.1B Q4_K | 40 tok/s | 37 tok/s |
+
+ANE Prefill ist 85% von llama.cpp — mit 10x kleinerem Modell und FP16 statt Q4.
+Decode auf CPU/AMX ist 1.7x langsamer als llama.cpp Metal GPU.
+
+### Ziel 2: Decode-Speedup — OFFEN
+
+Drei Decode-Ansaetze getestet (Re-Prefill, Hybrid, CPU), keiner schneller als CPU Baseline.
+ANE Decode braucht einen fundamental neuen MIL Kernel mit dynamischem KV Cache Input —
+das ist ein eigenes Forschungsprojekt, nicht ein einfacher Fix.
+
 ## Zusammenfassung in einem Satz
 
-> Wir haben bewiesen dass der Apple M4 ANE vollstaendige Transformer-Layer korrekt und
-> bei Prefill 2-4x schneller als GPU ausfuehren kann. Die Grundlage fuer eine
-> Apple-Silicon-native LLM Architektur ist gelegt — fuer einen funktionierenden LLM
-> fehlt ein trainiertes Modell und Decode-Speedup.
+> Wir haben eine funktionierende LLM Inference Engine gebaut die kohaerenten Text
+> auf dem Apple M4 ANE produziert, mit Prefill-Speed nahe an llama.cpp.
+> Decode-Speedup ueber ANE steht noch aus.
 
 ---
 

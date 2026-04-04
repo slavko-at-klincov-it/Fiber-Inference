@@ -24,6 +24,11 @@ static NSString *gen_sdpa_prefill_mil(int dim, int n_heads, int n_kv_heads,
                                        float rope_base, float rms_eps) {
     int kv_dim = n_kv_heads * head_dim;
     int gqa_ratio = n_heads / n_kv_heads;
+    if (n_kv_heads > 1 && n_heads % n_kv_heads != 0) {
+        fprintf(stderr, "ANE MIL: n_heads=%d not divisible by n_kv_heads=%d (GQA ratio %.1f)\n",
+                n_heads, n_kv_heads, (float)n_heads / n_kv_heads);
+        return nil;
+    }
     float scale = 1.0f / sqrtf((float)head_dim);
     float invd = 1.0f / (float)dim;
     int hd2 = head_dim / 2;

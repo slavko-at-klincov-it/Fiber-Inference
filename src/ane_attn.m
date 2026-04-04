@@ -83,6 +83,37 @@ static ANEWeight make_rope_weight(const char *name, int hd2, int seq, float base
     return w;
 }
 
+// Build sliding window causal mask as ANEWeight blob
+// window=0 means full causal (no window limit)
+static ANEWeight make_sliding_window_mask(const char *name, int seq, int window) {
+    size_t n = (size_t)seq * seq;
+    _Float16 *data = malloc(n * sizeof(_Float16));
+    _Float16 neg_inf = (_Float16)(-65504.0f);
+    for (int i = 0; i < seq; i++) {
+        for (int j = 0; j < seq; j++) {
+            bool causal = (j <= i);
+            bool in_window = (window <= 0) || ((i - j) < window);
+            data[(size_t)i * seq + j] = (causal && in_window) ? (_Float16)0.0f : neg_inf;
+        }
+    }
+    size_t data_bytes = n * sizeof(_Float16);
+    size_t total = 128 + data_bytes;
+    uint8_t *blob = calloc(1, total);
+    blob[0] = 0x01; blob[4] = 0x02;
+    blob[64] = 0xEF; blob[65] = 0xBE; blob[66] = 0xAD; blob[67] = 0xDE;
+    blob[68] = 0x01;
+    memcpy(blob + 72, &data_bytes, sizeof(uint64_t));
+    uint64_t payload_off = 128;
+    memcpy(blob + 80, &payload_off, sizeof(uint64_t));
+    memcpy(blob + 128, data, data_bytes);
+    free(data);
+    ANEWeight w;
+    w.name = name;
+    w.data = blob;
+    w.len = total;
+    return w;
+}
+
 // Build causal mask as ANEWeight blob
 static ANEWeight make_causal_mask(const char *name, int seq) {
     size_t n = (size_t)seq * seq;

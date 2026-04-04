@@ -8,13 +8,17 @@ LDFLAGS = -L$(LIBANE_DIR) -lane -Wl,-rpath,$(LIBANE_DIR)
 FRAMEWORKS = -framework Foundation -framework Metal -framework MetalPerformanceShaders \
              -framework IOSurface -framework Accelerate
 
-all: bench-sweep
+all: bench-sweep bench-limits
 
 bench-sweep: sweep.m
 	$(CC) $(CFLAGS) $(INCLUDES) $(FRAMEWORKS) $(LDFLAGS) -o $@ $^
 	install_name_tool -change libane.dylib @rpath/libane.dylib $@
 
+bench-limits: limits.m
+	$(CC) $(CFLAGS) $(INCLUDES) $(FRAMEWORKS) $(LDFLAGS) -o $@ $^
+	install_name_tool -change libane.dylib @rpath/libane.dylib $@
+
 clean:
-	rm -f bench-sweep
+	rm -f bench-sweep bench-limits
 
 .PHONY: all clean

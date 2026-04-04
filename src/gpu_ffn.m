@@ -60,7 +60,7 @@ static id<MTLBuffer> make_buf(id<MTLDevice> d, size_t n) {
 }
 
 static id<MTLComputePipelineState> pipe_for_type(gpu_context_t *c, ggml_type_t t) {
-    if (t == GGML_TYPE_Q4_K) return c->pipe_q4k; // Multi-row has bug, revert to original
+    if (t == GGML_TYPE_Q4_K) return c->pipe_q4k_mr; // Multi-row (fixed tg_input size)
     if (t == GGML_TYPE_Q5_K) return c->pipe_q5k;
     if (t == GGML_TYPE_Q6_K) return c->pipe_q6k;
     return c->pipe_q4k;

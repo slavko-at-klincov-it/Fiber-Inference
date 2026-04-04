@@ -64,7 +64,7 @@ kernel void q4k_matvec_mr(
     const int bpr = in_dim / 256;
 
     // Load input into threadgroup memory (shared across 4 rows)
-    threadgroup half tg_input[2048]; // max in_dim we support
+    threadgroup half tg_input[8192]; // max in_dim (supports up to ffn_dim=5632+)
     for (int i = int(tid); i < in_dim; i += 256) {
         tg_input[i] = input[i];
     }

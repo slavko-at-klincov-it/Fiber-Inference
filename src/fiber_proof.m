@@ -493,6 +493,14 @@ void fiber_proof_sweep(void) {
         // Depth test at dim=768
         { 768, 12, 12, 2048, 32, 128, "768d-32L"},
         { 768, 12, 12, 2048, 48, 128, "768d-48L"},
+        // Very large: 7B-9B (seq=32 — CPU baseline too slow at 128)
+        {4096, 64,  8, 11008, 32,  32, "~7B"},
+        {4096, 64,  8, 14336, 32,  32, "~9B"},
+        // Qwen3 exact dimensions (head_dim=128)
+        {1024,  8,  8,  3072, 28, 128, "Q3-0.6B"},
+        {2048, 16,  8,  6144, 28,  64, "Q3-1.7B"},
+        {2560, 20,  8,  9728, 36,  32, "Q3-4B"},
+        {4096, 32,  8, 12288, 36,  32, "Q3-8B"},
     };
     int n_cfgs = sizeof(cfgs) / sizeof(cfgs[0]);
 
@@ -500,7 +508,7 @@ void fiber_proof_sweep(void) {
 
     for (int ci = 0; ci < n_cfgs; ci++) {
         pconfig c = cfgs[ci];
-        int hd = 64;
+        int hd = c.dim / c.heads;  // head_dim derived from dim/heads
         int kv_dim = c.kv_heads * hd;
         int seq = c.seq;
 

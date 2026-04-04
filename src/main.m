@@ -302,6 +302,47 @@ static void run_fiber768_bench(const char *ckpt_path) {
         printf("  Total:         %6.1f ms (%.1f tok/s)\n", total2, (double)seq/(total2/1000.0));
         printf("====================================================\n");
 
+        // === Text Generation (if real weights loaded) ===
+        if (ckpt_path && fm->output) {
+            // Extract last token hidden state from x [dim, seq] channels-first
+            float *last_hidden = malloc(dim * sizeof(float));
+            for (int d = 0; d < dim; d++)
+                last_hidden[d] = (float)x[(size_t)d * seq + (seq - 1)];
+
+            // Final RMSNorm
+            float ss = 0;
+            for (int d = 0; d < dim; d++) ss += last_hidden[d] * last_hidden[d];
+            float rrms = 1.0f / sqrtf(ss / dim + FIBER_RMS_EPS);
+            float *norm_w = malloc(dim * sizeof(float));
+            for (int d = 0; d < dim; d++) norm_w[d] = (float)fm->output_norm[d];
+            for (int d = 0; d < dim; d++) last_hidden[d] *= rrms * norm_w[d];
+            free(norm_w);
+
+            // Classifier: logits = embedding^T @ last_hidden (vocab_size logits)
+            int vocab = FIBER_VOCAB;
+            float *logits = calloc(vocab, sizeof(float));
+            // embedding is [vocab, dim] FP16. Compute dot product per vocab entry.
+            for (int v = 0; v < vocab; v++) {
+                float dot = 0;
+                for (int d = 0; d < dim; d++)
+                    dot += (float)fm->output[(size_t)v * dim + d] * last_hidden[d];
+                logits[v] = dot;
+            }
+
+            // Top-5 tokens
+            printf("\n--- Text Generation (greedy from last token) ---\n");
+            printf("Top-5 logits: ");
+            for (int k = 0; k < 5; k++) {
+                int best = 0;
+                for (int v = 1; v < vocab; v++)
+                    if (logits[v] > logits[best]) best = v;
+                printf("[%d]=%.2f ", best, logits[best]);
+                logits[best] = -1e9f; // mask for next iteration
+            }
+            printf("\n");
+            free(logits); free(last_hidden);
+        }
+
         for (int l = 0; l < n_layers_use; l++) ane_free(ffn_kernels[l]);
     }
 

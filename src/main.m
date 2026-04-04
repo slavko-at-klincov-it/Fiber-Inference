@@ -409,6 +409,12 @@ int main(int argc, char *argv[]) {
             return 0;
         }
 
+        // --arch sweep — extended proof across dim/heads/layers
+        if (arch_mode && strcmp(arch_mode, "sweep") == 0) {
+            fiber_proof_sweep();
+            return 0;
+        }
+
         // --arch proof — A/B comparison with real text output
         if (arch_mode && strcmp(arch_mode, "proof") == 0) {
             const char *ckpt = "/Users/slavkoklincov/Code/ANE-Training/training/training_dynamic/ane_stories110M_dyn_ckpt.bin";

@@ -10,4 +10,8 @@
 // 5. Compare output + measure speed
 void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *prompt);
 
+// Extended proof: sweep dim/heads/layers with synthetic weights,
+// CPU vs ANE for each config, verify token match.
+void fiber_proof_sweep(void);
+
 #endif

@@ -384,3 +384,263 @@ void fiber_proof(const char *ckpt_path, const char *gguf_path, const char *promp
     tokenizer_free(tok); gguf_close(gf);
     fiber_model_free(fm);
 }
+
+// ============================================================
+// Extended Proof Sweep: CPU vs ANE across dim/heads/layers
+// Synthetic random weights, verifies token match at each config
+// ============================================================
+
+// Minimal CPU prefill for synthetic model (no tokenizer needed)
+static float *synth_cpu_prefill(float **wq, float **wk, float **wv, float **wo,
+                                 float **w1, float **w3, float **w2,
+                                 float **anorm, float **fnorm,
+                                 float *embed, float *out_norm, float *out_w,
+                                 int dim, int heads, int kv_heads, int hd,
+                                 int ffn, int layers, int vocab, int seq) {
+    float eps = 1e-5f;
+    // Embed: token IDs 0..seq-1 → x[t] = embed[t % vocab]
+    // Process all tokens, keep last hidden state
+    float *x = malloc(dim * sizeof(float));
+    float **kc = calloc(layers, sizeof(float*));
+    float **vc = calloc(layers, sizeof(float*));
+    int kv_dim = kv_heads * hd;
+    for (int l = 0; l < layers; l++) {
+        kc[l] = calloc((size_t)seq * kv_dim, sizeof(float));
+        vc[l] = calloc((size_t)seq * kv_dim, sizeof(float));
+    }
+    float *xn = malloc(dim * sizeof(float));
+    float *q = malloc(dim * sizeof(float));
+    float *k = malloc(kv_dim * sizeof(float));
+    float *v = malloc(kv_dim * sizeof(float));
+
+    for (int t = 0; t < seq; t++) {
+        for (int d = 0; d < dim; d++) x[d] = embed[(t % vocab) * dim + d];
+        for (int l = 0; l < layers; l++) {
+            cpu_rmsnorm(xn, x, anorm[l], dim, eps);
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,dim,dim,1,wq[l],dim,xn,1,0,q,1);
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,kv_dim,dim,1,wk[l],dim,xn,1,0,k,1);
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,kv_dim,dim,1,wv[l],dim,xn,1,0,v,1);
+            cpu_rope(q, k, heads, kv_heads, hd, t, 10000.0f);
+            memcpy(kc[l]+(size_t)t*kv_dim, k, kv_dim*sizeof(float));
+            memcpy(vc[l]+(size_t)t*kv_dim, v, kv_dim*sizeof(float));
+            float *ao = calloc(dim, sizeof(float));
+            float sc = 1.0f/sqrtf((float)hd);
+            for (int h = 0; h < heads; h++) {
+                int kvh = h * kv_heads / heads;
+                float *scores = malloc((t+1)*sizeof(float));
+                for (int p = 0; p <= t; p++) {
+                    float d2=0; for (int d=0;d<hd;d++) d2+=q[h*hd+d]*kc[l][p*kv_dim+kvh*hd+d];
+                    scores[p]=d2*sc;
+                }
+                float mx=scores[0]; for(int p=1;p<=t;p++) if(scores[p]>mx)mx=scores[p];
+                float sm=0; for(int p=0;p<=t;p++){scores[p]=expf(scores[p]-mx);sm+=scores[p];}
+                for(int p=0;p<=t;p++) scores[p]/=sm;
+                for(int p=0;p<=t;p++) for(int d=0;d<hd;d++) ao[h*hd+d]+=scores[p]*vc[l][p*kv_dim+kvh*hd+d];
+                free(scores);
+            }
+            float *proj = malloc(dim*sizeof(float));
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,dim,dim,1,wo[l],dim,ao,1,0,proj,1);
+            for(int d=0;d<dim;d++) x[d]+=proj[d];
+            free(ao); free(proj);
+            cpu_rmsnorm(xn,x,fnorm[l],dim,eps);
+            float *h1=malloc(ffn*sizeof(float)),*h3=malloc(ffn*sizeof(float));
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,ffn,dim,1,w1[l],dim,xn,1,0,h1,1);
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,ffn,dim,1,w3[l],dim,xn,1,0,h3,1);
+            for(int i=0;i<ffn;i++){float s=h1[i]/(1+expf(-h1[i]));h1[i]=s*h3[i];}
+            float *fo=malloc(dim*sizeof(float));
+            cblas_sgemv(CblasRowMajor,CblasNoTrans,dim,ffn,1,w2[l],ffn,h1,1,0,fo,1);
+            for(int d=0;d<dim;d++) x[d]+=fo[d];
+            free(h1);free(h3);free(fo);
+        }
+    }
+    // Classifier
+    float *fn = malloc(dim*sizeof(float));
+    cpu_rmsnorm(fn, x, out_norm, dim, eps);
+    float *logits = malloc(vocab * sizeof(float));
+    for (int v2 = 0; v2 < vocab; v2++) {
+        float d2=0; for(int d=0;d<dim;d++) d2+=out_w[v2*dim+d]*fn[d]; logits[v2]=d2;
+    }
+    free(fn); free(x); free(xn); free(q); free(k); free(v);
+    for(int l=0;l<layers;l++){free(kc[l]);free(vc[l]);} free(kc);free(vc);
+    return logits;
+}
+
+void fiber_proof_sweep(void) {
+    timer_init(); srand(42);
+    ane_init();
+
+    printf("\n=== EXTENDED PROOF SWEEP ===\n");
+    printf("CPU/AMX vs ANE across configurations. Token match verifies correctness.\n\n");
+    printf("%-5s %-5s %-4s %-5s %-5s | %8s %8s %7s %6s\n",
+           "dim","heads","kv","ffn","lyrs","cpu_ms","ane_ms","speedup","match");
+    printf("--------------------------------------------------------------\n");
+
+    typedef struct { int dim; int heads; int kv_heads; int ffn; int layers; } pconfig;
+    pconfig cfgs[] = {
+        // Vary dim (heads=dim/64, MHA, ffn=2.67x, 12 layers)
+        { 256,  4,  4,  684, 12},
+        { 384,  6,  6, 1024, 12},
+        { 512,  8,  8, 1365, 12},
+        { 768, 12, 12, 2048, 12},
+        {1024, 16, 16, 2730,  8},
+        // Vary layers (dim=768)
+        { 768, 12, 12, 2048,  4},
+        { 768, 12, 12, 2048,  8},
+        { 768, 12, 12, 2048, 12},
+        { 768, 12, 12, 2048, 24},
+        // Vary GQA (dim=768, 12 layers)
+        { 768, 12,  4, 2048, 12},
+        { 768, 12,  2, 2048, 12},
+        { 768, 12,  1, 2048, 12},
+        // Vary FFN ratio (dim=768, 12 layers)
+        { 768, 12, 12, 1536, 12},  // 2x
+        { 768, 12, 12, 3072, 12},  // 4x
+    };
+    int n_cfgs = sizeof(cfgs) / sizeof(cfgs[0]);
+
+    int seq = 128; // fixed, within ANE sweet spot
+    int vocab = 1000; // small vocab for speed (synthetic, no real text)
+
+    for (int ci = 0; ci < n_cfgs; ci++) {
+        pconfig c = cfgs[ci];
+        int hd = 64;
+        int kv_dim = c.kv_heads * hd;
+
+        // Allocate synthetic FP32 weights
+        float **wq=calloc(c.layers,sizeof(float*)), **wk=calloc(c.layers,sizeof(float*));
+        float **wv=calloc(c.layers,sizeof(float*)), **wo=calloc(c.layers,sizeof(float*));
+        float **w1f=calloc(c.layers,sizeof(float*)), **w3f=calloc(c.layers,sizeof(float*));
+        float **w2f=calloc(c.layers,sizeof(float*));
+        float **an=calloc(c.layers,sizeof(float*)), **fn=calloc(c.layers,sizeof(float*));
+
+        for (int l = 0; l < c.layers; l++) {
+            wq[l]=malloc(c.dim*c.dim*4); wk[l]=malloc(kv_dim*c.dim*4);
+            wv[l]=malloc(kv_dim*c.dim*4); wo[l]=malloc(c.dim*c.dim*4);
+            w1f[l]=malloc(c.ffn*c.dim*4); w3f[l]=malloc(c.ffn*c.dim*4);
+            w2f[l]=malloc(c.dim*c.ffn*4);
+            an[l]=malloc(c.dim*4); fn[l]=malloc(c.dim*4);
+            float sc=sqrtf(2.0f/(c.dim+c.dim));
+            for(int i=0;i<c.dim*c.dim;i++) wq[l][i]=sc*((rand()%2000-1000)/1000.0f);
+            for(int i=0;i<kv_dim*c.dim;i++) wk[l][i]=sc*((rand()%2000-1000)/1000.0f);
+            for(int i=0;i<kv_dim*c.dim;i++) wv[l][i]=sc*((rand()%2000-1000)/1000.0f);
+            for(int i=0;i<c.dim*c.dim;i++) wo[l][i]=sc*((rand()%2000-1000)/1000.0f);
+            float scf=sqrtf(2.0f/(c.dim+c.ffn));
+            for(int i=0;i<c.ffn*c.dim;i++) w1f[l][i]=scf*((rand()%2000-1000)/1000.0f);
+            for(int i=0;i<c.ffn*c.dim;i++) w3f[l][i]=scf*((rand()%2000-1000)/1000.0f);
+            for(int i=0;i<c.dim*c.ffn;i++) w2f[l][i]=scf*((rand()%2000-1000)/1000.0f);
+            for(int i=0;i<c.dim;i++) { an[l][i]=1.0f; fn[l][i]=1.0f; }
+        }
+        float *embed = malloc(vocab*c.dim*4);
+        for(int i=0;i<vocab*c.dim;i++) embed[i]=0.01f*((rand()%200-100)/100.0f);
+        float *out_norm = malloc(c.dim*4);
+        for(int i=0;i<c.dim;i++) out_norm[i]=1.0f;
+
+        // === CPU prefill ===
+        uint64_t t0 = timer_now();
+        float *cpu_logits = synth_cpu_prefill(wq,wk,wv,wo,w1f,w3f,w2f,an,fn,
+                                               embed,out_norm,embed,
+                                               c.dim,c.heads,c.kv_heads,hd,
+                                               c.ffn,c.layers,vocab,seq);
+        double cpu_ms = timer_ms(t0, timer_now());
+        int cpu_tok = argmax(cpu_logits, vocab);
+
+        // === ANE prefill ===
+        int ane_seq = seq < 128 ? 128 : seq;
+        NSString *mil = gen_sdpa_prefill_mil(c.dim, c.heads, c.kv_heads, hd,
+                                              ane_seq, 10000.0f, 1e-5f);
+        NSString *fmil = gen_ffn_only_mil(c.dim, c.ffn, ane_seq, 1e-5f);
+        size_t in_b = (size_t)c.dim*ane_seq*2;
+        int oc = c.dim + 2*kv_dim;
+        size_t out_b = (size_t)oc*ane_seq*2;
+        size_t fout_b = in_b;
+
+        ANEKernel **ak = calloc(c.layers, sizeof(ANEKernel*));
+        ANEKernel **fk = calloc(c.layers, sizeof(ANEKernel*));
+        bool compile_ok = true;
+
+        for (int l = 0; l < c.layers; l++) {
+            int hd2=hd/2;
+            float *cd=malloc(hd2*ane_seq*4),*sd=malloc(hd2*ane_seq*4);
+            for(int i=0;i<hd2;i++){float f=1.0f/powf(10000.0f,2.0f*i/(float)hd);
+                for(int p=0;p<ane_seq;p++){cd[i*ane_seq+p]=cosf(p*f);sd[i*ane_seq+p]=sinf(p*f);}}
+            float *mk=malloc(ane_seq*ane_seq*4);
+            for(int i=0;i<ane_seq;i++) for(int j=0;j<ane_seq;j++) mk[i*ane_seq+j]=(j<=i)?0:-65504.0f;
+
+            ANEWeight aw[8];
+            aw[0]=ane_weight_fp16("@model_path/weights/rms1.bin",an[l],1,c.dim);
+            aw[1]=ane_weight_fp16("@model_path/weights/wq.bin",wq[l],c.dim,c.dim);
+            aw[2]=ane_weight_fp16("@model_path/weights/wk.bin",wk[l],kv_dim,c.dim);
+            aw[3]=ane_weight_fp16("@model_path/weights/wv.bin",wv[l],kv_dim,c.dim);
+            aw[4]=ane_weight_fp16("@model_path/weights/wo.bin",wo[l],c.dim,c.dim);
+            aw[5]=ane_weight_fp16("@model_path/weights/cos.bin",cd,hd2,ane_seq);
+            aw[6]=ane_weight_fp16("@model_path/weights/sin.bin",sd,hd2,ane_seq);
+            aw[7]=ane_weight_fp16("@model_path/weights/mask.bin",mk,ane_seq,ane_seq);
+            ak[l]=ane_compile([mil UTF8String],strlen([mil UTF8String]),aw,8,1,&in_b,1,&out_b,ANE_QOS_BACKGROUND);
+            for(int w=0;w<8;w++) ane_weight_free(&aw[w]);
+
+            ANEWeight fw[4];
+            fw[0]=ane_weight_fp16("@model_path/weights/ffn_norm.bin",fn[l],1,c.dim);
+            fw[1]=ane_weight_fp16("@model_path/weights/w1.bin",w1f[l],c.ffn,c.dim);
+            fw[2]=ane_weight_fp16("@model_path/weights/w3.bin",w3f[l],c.ffn,c.dim);
+            fw[3]=ane_weight_fp16("@model_path/weights/w2.bin",w2f[l],c.dim,c.ffn);
+            fk[l]=ane_compile([fmil UTF8String],strlen([fmil UTF8String]),fw,4,1,&in_b,1,&fout_b,ANE_QOS_BACKGROUND);
+            for(int w=0;w<4;w++) ane_weight_free(&fw[w]);
+
+            free(cd);free(sd);free(mk);
+            if(!ak[l]||!fk[l]) { compile_ok=false; break; }
+        }
+
+        double ane_ms = -1;
+        int ane_tok = -1;
+        if (compile_ok) {
+            _Float16 *xb = calloc((size_t)c.dim*ane_seq, sizeof(_Float16));
+            for(int t=0;t<seq;t++) for(int d=0;d<c.dim;d++)
+                xb[(size_t)d*ane_seq+t]=(_Float16)embed[(t%vocab)*c.dim+d];
+
+            // Warmup
+            ane_write(ak[0],0,xb,in_b); ane_eval(ak[0],ANE_QOS_BACKGROUND);
+
+            t0 = timer_now();
+            for(int l=0;l<c.layers;l++){
+                ane_lock_input(ak[l],0); memcpy(ane_input_ptr(ak[l],0),xb,in_b); ane_unlock_input(ak[l],0);
+                ane_eval(ak[l],ANE_QOS_BACKGROUND);
+                ane_lock_output(ak[l],0); memcpy(xb,ane_output_ptr(ak[l],0),in_b); ane_unlock_output(ak[l],0);
+                ane_lock_input(fk[l],0); memcpy(ane_input_ptr(fk[l],0),xb,in_b); ane_unlock_input(fk[l],0);
+                ane_eval(fk[l],ANE_QOS_BACKGROUND);
+                ane_lock_output(fk[l],0); memcpy(xb,ane_output_ptr(fk[l],0),in_b); ane_unlock_output(fk[l],0);
+            }
+            ane_ms = timer_ms(t0, timer_now());
+
+            // Classifier
+            float *lh=malloc(c.dim*4);
+            for(int d=0;d<c.dim;d++) lh[d]=(float)xb[(size_t)d*ane_seq+(seq-1)];
+            float *fnr=malloc(c.dim*4);
+            cpu_rmsnorm(fnr,lh,out_norm,c.dim,1e-5f);
+            float *lg=malloc(vocab*4);
+            for(int v2=0;v2<vocab;v2++){float d2=0;for(int d=0;d<c.dim;d++)d2+=embed[v2*c.dim+d]*fnr[d];lg[v2]=d2;}
+            ane_tok = argmax(lg, vocab);
+            free(lh);free(fnr);free(lg);free(xb);
+        }
+
+        // Print result
+        bool match = (cpu_tok == ane_tok);
+        printf("%-5d %-5d %-4d %-5d %-5d | %7.1f %7.1f %6.1fx %6s\n",
+               c.dim, c.heads, c.kv_heads, c.ffn, c.layers,
+               cpu_ms, ane_ms > 0 ? ane_ms : -1,
+               ane_ms > 0 ? cpu_ms/ane_ms : 0,
+               compile_ok ? (match ? "YES" : "NO") : "FAIL");
+
+        // Cleanup
+        for(int l=0;l<c.layers;l++){
+            if(ak[l])ane_free(ak[l]); if(fk[l])ane_free(fk[l]);
+            free(wq[l]);free(wk[l]);free(wv[l]);free(wo[l]);
+            free(w1f[l]);free(w3f[l]);free(w2f[l]);free(an[l]);free(fn[l]);
+        }
+        free(ak);free(fk);free(wq);free(wk);free(wv);free(wo);
+        free(w1f);free(w3f);free(w2f);free(an);free(fn);
+        free(embed);free(out_norm);free(cpu_logits);
+    }
+
+    printf("\nCompile budget used: %d / 119\n", ane_compile_count());
+    printf("=== SWEEP COMPLETE ===\n");
+}

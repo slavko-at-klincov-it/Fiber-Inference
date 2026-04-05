@@ -418,13 +418,14 @@ int main(int argc, char *argv[]) {
         // --arch proof — A/B comparison with real text output
         // Prefers pretrained stories110M.bin if available
         if (arch_mode && strcmp(arch_mode, "proof") == 0) {
-            const char *ckpt;
-            FILE *_tf = fopen("models/stories110M.bin", "rb");
+            const char *ckpt = "models/stories110M.bin";
+            FILE *_tf = fopen(ckpt, "rb");
             if (_tf) {
                 fclose(_tf);
-                ckpt = "models/stories110M.bin"; // pretrained, coherent text
             } else {
-                ckpt = "/Users/slavkoklincov/Code/ANE-Training/training/training_dynamic/ane_stories110M_dyn_ckpt.bin";
+                fprintf(stderr, "Error: checkpoint not found at %s\n", ckpt);
+                fprintf(stderr, "Place stories110M.bin in models/ or use --arch fiber768:/path/to/ckpt.bin\n");
+                return 1;
             }
             const char *gguf = "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf";
             fiber_proof(ckpt, gguf, prompt);

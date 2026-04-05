@@ -1,12 +1,30 @@
+# Compiled binaries
+fiber-inference
+*.o
+*.dylib
+bench/bench-sweep
+bench/bench-large
+bench/bench-limits
+bench/parallel-test
+bench/combo-test
+bench/test-dynamic
+bench/test-int8
+bench/test-sliding
+bench/test-dyn-small
+
+# Model files
 models/*.gguf
 models/*.bin
 models/.cache/
-*.o
-*.dylib
-!lib/libane.dylib
-fiber-inference
-.DS_Store
+
+# Debug output
 debug/*.bin
 debug/**/*.bin
 debug/*.txt
+
+# macOS
+.DS_Store
+
+# AI assistant config
 CLAUDE.md
+.claude/

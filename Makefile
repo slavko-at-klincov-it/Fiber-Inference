@@ -1,4 +1,4 @@
-ANE_DIR = /Users/slavkoklincov/Code/ANE-Training
+ANE_DIR ?= ../ANE-Training
 LIBANE_DIR = $(ANE_DIR)/libane
 TRAINING_DIR = $(ANE_DIR)/training
 

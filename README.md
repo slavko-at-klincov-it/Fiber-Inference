@@ -1,40 +1,65 @@
 # Fiber-Inference
 
-Multi-accelerator LLM inference engine for Apple M4, combining ANE attention + GPU FFN
-with mmap/SSD weight offloading.
+Systematische Evaluation aller 5 Compute Units des Apple M4 für LLM Inference.
 
-**What this enables on M4 16GB that no existing framework can do:**
-- 30B Q4 models (normally: max ~14B)
-- 128K context on 7B (normally: max ~32K)
-- Higher tok/s through parallel ANE+GPU execution
+48 Commits, über 200 Messungen, 27 Dokumentationsdateien.
 
-## Status
+## Ergebnis
 
-Phase 0: GGUF Loader + Skeleton
+Die Apple Neural Engine (ANE) kann korrekte Transformer-Layer ausführen und
+erreicht bis zu 21.490 tok/s Prefill. Aber Apple's eigenes MLX-Framework
+ist 2,2× schneller — vertikale Hardware-Software-Integration schlägt
+Reverse Engineering.
+
+**Paper:** `docs/paper.md` (auch als PDF in Documents/)
+
+## Kernfindungen
+
+1. **ANE Prefill funktioniert** — 32/32 Token-Match, kohärenter Text generiert
+2. **AMX ist 1,8× schneller als GPU** für FFN bei dim≤1024 — kein Framework nutzt das
+3. **Parallele Units sind langsamer** — Memory-Bandwidth-Konkurrenz (-40%)
+4. **MLX gewinnt** — 2,2× schneller als unsere beste Konfiguration
+5. **Bandwidth > FLOPS** — die zentrale Erkenntnis für Apple Silicon LLMs
 
 ## Build
 
 ```bash
 make
-./fiber-inference --model models/your-model.gguf
+./fiber-inference --model models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf --prompt "Hello" --tokens 32
+
+# ANE Proof (benötigt stories110M.bin):
+./fiber-inference --arch proof --prompt "Once upon a time"
+
+# Hardware Sweep:
+cd bench && make && ./bench-sweep
+
+# Parallel Unit Test:
+./parallel-test
 ```
 
-## Architecture
+## Verwandte Repositories
 
-```
-Per token, per layer:
-  ANE  ──── Fused SDPA (7.5x faster than GPU for attention) ────┐
-  GPU  ──── FFN (dequant Q4→FP16 + MPS matmul + SiLU) ─────────┤
-  SSD  ──── Prefetch next layer weights (E-Core background) ────┤
-  CPU  ──── Residual add + orchestration ────────────────────────┘
-                                                                  ↓
-                                                            Next layer
-```
+| Repo | Was | Commits |
+|------|-----|---------|
+| **Fiber-Inference** (dieses Repo) | Inference Engine + Paper + Benchmarks | 48 |
+| **M4_RE** (`/Code/M4_RE`) | Hardware Reverse Engineering (33 Experimente) | 48 |
+| **ANE-Training** (`/Code/ANE-Training`) | ANE Training + libane C API | 99 |
 
-All accelerators share Unified Memory (zero-copy via IOSurface).
+Archivierte Projekte (abgebrochen): `archive/Fiber-LLM`, `archive/gdc-lm`, `archive/fiber-train`
 
-## Requirements
+## Dokumentation
 
-- macOS 26.x (Apple Silicon M4)
-- libane (symlinked from ANE-Training project)
-- GGUF model files (Q4_K_M recommended)
+Alle Findings in `docs/`:
+- `paper.md` — Vollständiges Research Paper
+- `hardware-sweep.md` — ANE/GPU/AMX GFLOPS pro Dimension
+- `proof.md` + `proof-sweep.md` — Korrektheitsbeweis
+- `parallel-units-test.md` — Multi-Unit Test (langsamer!)
+- `ane-vs-ollama-gemessen.md` — Fairer Vergleich
+- `finale-erkenntnisse.md` — Was jede Unit kann und wann
+- Und 20 weitere...
+
+## Hardware
+
+- Apple M4 Mac Mini, 16 GB Unified Memory
+- macOS, Xcode Command Line Tools
+- libane (symlinked aus ANE-Training)

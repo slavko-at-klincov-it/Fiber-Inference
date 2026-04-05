@@ -28,7 +28,7 @@ die Produktions-Engines Ollama/MLX und llama.cpp.
 
 3. Parallele Nutzung mehrerer Units auf demselben Modell ist kontraproduktiv.
    Memory-Bandwidth-Konkurrenz (120 GB/s geteilt) reduziert den Durchsatz
-   um 30-40% statt ihn zu erh��hen.
+   um 30-40% statt ihn zu erhöhen.
 
 4. Sechs ANE-Optimierungen wurden getestet — vier scheitern an Hardware-Limits
    (INT8: Compiler-Fehler, Dynamic Weights: ab IC≥256, Sliding Window: 0% Speedup,

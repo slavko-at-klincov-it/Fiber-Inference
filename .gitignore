@@ -9,3 +9,4 @@ fiber-inference
 debug/*.bin
 debug/**/*.bin
 debug/*.txt
+CLAUDE.md

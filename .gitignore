@@ -25,6 +25,11 @@ debug/*.txt
 # macOS
 .DS_Store
 
+# Generated docs
+docs/*.pdf
+docs/*.html
+docs/*.css
+
 # AI assistant config
 CLAUDE.md
 .claude/

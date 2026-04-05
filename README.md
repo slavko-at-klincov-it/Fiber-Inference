@@ -7,7 +7,7 @@
 [![Language](https://img.shields.io/badge/Language-Objective--C%20%2F%20C%20%2F%20Metal-orange.svg)]()
 
 > 48 Commits, über 200 Messungen, 27 Dokumentationsdateien.
-> Vollständiges Research Paper: [`docs/paper.md`](docs/paper.md)
+> Vollständiges Research Paper: [**Online lesen**](https://slavko-at-klincov-it.github.io/Fiber-Inference/paper) | [`docs/paper.md`](docs/paper.md)
 
 ---
 
